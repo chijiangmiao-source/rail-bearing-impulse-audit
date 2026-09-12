@@ -1,0 +1,8 @@
+# Binaries
+/bin/
+/out/
+*.test
+*.out
+
+# Local env
+.env

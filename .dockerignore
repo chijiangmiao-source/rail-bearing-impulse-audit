@@ -1,0 +1,13 @@
+# VCS / editor noise
+.git
+.gitignore
+*.md
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Build artifacts
+/bin/
+/out/
+*.test
+*.out
