@@ -21,17 +21,19 @@ const maxBodyBytes = 4 << 20
 
 // AnalyzeRequest is the JSON request contract.
 type AnalyzeRequest struct {
-	SampleRate float64   `json:"sample_rate"`
-	Amplitudes []float64 `json:"amplitudes"`
+	SampleRate     float64       `json:"sample_rate"`
+	Amplitudes     []float64     `json:"amplitudes"`
+	ExcludedRanges []pulse.Range `json:"excluded_ranges,omitempty"`
 }
 
 // AnalyzeResponse is the full, deterministic response contract.
 type AnalyzeResponse struct {
-	SampleRate float64       `json:"sample_rate"`
-	Decidable  bool          `json:"decidable"`
-	Baseline   float64       `json:"baseline"`
-	Reason     string        `json:"reason,omitempty"`
-	Pulses     []pulse.Pulse `json:"pulses"`
+	SampleRate     float64       `json:"sample_rate"`
+	Decidable      bool          `json:"decidable"`
+	Baseline       float64       `json:"baseline"`
+	Reason         string        `json:"reason,omitempty"`
+	Pulses         []pulse.Pulse `json:"pulses"`
+	ExcludedRanges []pulse.Range `json:"excluded_ranges,omitempty"`
 }
 
 // FieldError locates a rejected request at a field, or at one sample index.
@@ -45,11 +47,12 @@ type FieldError struct {
 
 func (e *FieldError) HTTPStatus() int { return http.StatusBadRequest }
 
-// rawAnalyzeRequest keeps the two fields as raw tokens so type errors can be
-// attributed to the field or to an individual amplitude index.
+// rawAnalyzeRequest keeps the fields as raw tokens so type errors can be
+// attributed to the field or to an individual amplitude/range index.
 type rawAnalyzeRequest struct {
-	SampleRate *json.RawMessage `json:"sample_rate"`
-	Amplitudes *json.RawMessage `json:"amplitudes"`
+	SampleRate     *json.RawMessage `json:"sample_rate"`
+	Amplitudes     *json.RawMessage `json:"amplitudes"`
+	ExcludedRanges *json.RawMessage `json:"excluded_ranges"`
 }
 
 // NewRouter builds the HTTP router.
@@ -75,13 +78,14 @@ func analyzeHandler(c *gin.Context) {
 		return
 	}
 
-	result := pulse.Analyze(req.Amplitudes)
+	result := pulse.Analyze(req.Amplitudes, req.ExcludedRanges...)
 	c.JSON(http.StatusOK, AnalyzeResponse{
-		SampleRate: req.SampleRate,
-		Decidable:  result.Decidable,
-		Baseline:   result.Baseline,
-		Reason:     result.Reason,
-		Pulses:     result.Pulses,
+		SampleRate:     req.SampleRate,
+		Decidable:      result.Decidable,
+		Baseline:       result.Baseline,
+		Reason:         result.Reason,
+		Pulses:         result.Pulses,
+		ExcludedRanges: req.ExcludedRanges,
 	})
 }
 
@@ -136,7 +140,19 @@ func decodeAnalyzeRequest(r *http.Request) (*AnalyzeRequest, *FieldError) {
 		return nil, ferr
 	}
 
-	return &AnalyzeRequest{SampleRate: sampleRate, Amplitudes: amplitudes}, nil
+	var ranges []pulse.Range
+	if raw.ExcludedRanges != nil {
+		ranges, ferr = parseExcludedRanges(*raw.ExcludedRanges, len(amplitudes))
+		if ferr != nil {
+			return nil, ferr
+		}
+	}
+
+	return &AnalyzeRequest{
+		SampleRate:     sampleRate,
+		Amplitudes:     amplitudes,
+		ExcludedRanges: ranges,
+	}, nil
 }
 
 func parseSampleRate(token json.RawMessage) (float64, *FieldError) {
@@ -229,6 +245,102 @@ func amplitudeTypeError(i int) *FieldError {
 		Index: intPtr(i), Constraint: "type",
 		Message: fmt.Sprintf("amplitudes[%d] must be a finite JSON number", i),
 	}
+}
+
+// rawRange keeps endpoints nullable so a missing/null endpoint is
+// distinguishable from a valid zero.
+type rawRange struct {
+	Start *float64 `json:"start"`
+	End   *float64 `json:"end"`
+}
+
+// parseExcludedRanges parses and validates excluded_ranges against an
+// amplitudes slice of length n. Every error is located at the offending
+// element index; structural errors (a non-array value) are field-level.
+// A JSON null never reaches here: it leaves the outer pointer nil and is
+// treated as "field omitted".
+func parseExcludedRanges(token json.RawMessage, n int) ([]pulse.Range, *FieldError) {
+	var rawItems []json.RawMessage
+	if err := json.Unmarshal(token, &rawItems); err != nil {
+		return nil, &FieldError{
+			Error: "validation_failed", Field: "excluded_ranges",
+			Constraint: "type", Message: "excluded_ranges must be a JSON array",
+		}
+	}
+
+	ranges := make([]pulse.Range, len(rawItems))
+	for i, item := range rawItems {
+		if isNull(item) {
+			return nil, excludedTypeError(i, "excluded_ranges[%d] must be an object, got null", i)
+		}
+		var rr rawRange
+		dec := json.NewDecoder(bytes.NewReader(item))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&rr); err != nil {
+			var ute *json.UnmarshalTypeError
+			if errors.As(err, &ute) && ute.Field != "" {
+				return nil, excludedTypeError(i,
+					"excluded_ranges[%d].%s must be an integer JSON number", i, ute.Field)
+			}
+			msg := err.Error()
+			if strings.HasPrefix(msg, "json: unknown field ") {
+				name := strings.Trim(strings.TrimPrefix(msg, "json: unknown field "), `"`)
+				return nil, &FieldError{
+					Error: "validation_failed", Field: "excluded_ranges",
+					Index: intPtr(i), Constraint: "unknown",
+					Message: fmt.Sprintf("excluded_ranges[%d] has unknown field %q", i, name),
+				}
+			}
+			return nil, excludedTypeError(i,
+				"excluded_ranges[%d] must be a {start, end} object", i)
+		}
+		// Reject trailing non-whitespace tokens inside the element.
+		if tok := dec.Decode(&struct{}{}); !errors.Is(tok, io.EOF) {
+			return nil, excludedTypeError(i,
+				"excluded_ranges[%d] must be a single {start, end} object", i)
+		}
+		if rr.Start == nil {
+			return nil, excludedRequiredError(i, "start")
+		}
+		if rr.End == nil {
+			return nil, excludedRequiredError(i, "end")
+		}
+		if !isJSONInteger(*rr.Start) || !isJSONInteger(*rr.End) {
+			return nil, excludedTypeError(i,
+				"excluded_ranges[%d] start and end must be integer sample indices", i)
+		}
+		ranges[i] = pulse.Range{Start: int(*rr.Start), End: int(*rr.End)}
+	}
+
+	if verr := pulse.ValidateRanges(ranges, n); verr != nil {
+		return nil, &FieldError{
+			Error: "validation_failed", Field: "excluded_ranges",
+			Index: intPtr(verr.Index), Constraint: verr.Constraint,
+			Message: verr.Message,
+		}
+	}
+	return ranges, nil
+}
+
+func excludedTypeError(i int, format string, args ...any) *FieldError {
+	return &FieldError{
+		Error: "validation_failed", Field: "excluded_ranges",
+		Index: intPtr(i), Constraint: "type",
+		Message: fmt.Sprintf(format, args...),
+	}
+}
+
+func excludedRequiredError(i int, endpoint string) *FieldError {
+	return &FieldError{
+		Error: "validation_failed", Field: "excluded_ranges",
+		Index: intPtr(i), Constraint: "required",
+		Message: fmt.Sprintf("excluded_ranges[%d].%s is required", i, endpoint),
+	}
+}
+
+// isJSONInteger reports whether a decoded finite JSON number is integral.
+func isJSONInteger(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0) && math.Trunc(v) == v
 }
 
 // decodeError translates a JSON decode error into a located FieldError.
@@ -342,6 +454,28 @@ func nonFiniteError(stack []frame, pendingKey string) *FieldError {
 			return &FieldError{
 				Error: "validation_failed", Field: "sample_rate",
 				Constraint: "finite", Message: "sample_rate must be finite",
+			}
+		}
+		// A start/end value inside an excluded_ranges element object.
+		if top.kind == '{' && (pendingKey == "start" || pendingKey == "end") &&
+			len(stack) >= 2 {
+			if parent := stack[len(stack)-2]; parent.kind == '[' && parent.key == "excluded_ranges" {
+				return &FieldError{
+					Error: "validation_failed", Field: "excluded_ranges",
+					Index: intPtr(parent.idx), Constraint: "type",
+					Message: fmt.Sprintf(
+						"excluded_ranges[%d].%s must be an integer JSON number",
+						parent.idx, pendingKey),
+				}
+			}
+		}
+		// A bare non-finite literal where an element object was expected.
+		if top.kind == '[' && top.key == "excluded_ranges" {
+			return &FieldError{
+				Error: "validation_failed", Field: "excluded_ranges",
+				Index: intPtr(top.idx), Constraint: "type",
+				Message: fmt.Sprintf(
+					"excluded_ranges[%d] must be a {start, end} object", top.idx),
 			}
 		}
 	}

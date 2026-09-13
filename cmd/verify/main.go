@@ -31,12 +31,18 @@ type pulseDTO struct {
 	Baseline  float64 `json:"baseline"`
 }
 
+type rangeDTO struct {
+	Start int `json:"start"`
+	End   int `json:"end"`
+}
+
 type analyzeDTO struct {
-	SampleRate float64    `json:"sample_rate"`
-	Decidable  bool       `json:"decidable"`
-	Baseline   float64    `json:"baseline"`
-	Reason     string     `json:"reason"`
-	Pulses     []pulseDTO `json:"pulses"`
+	SampleRate     float64    `json:"sample_rate"`
+	Decidable      bool       `json:"decidable"`
+	Baseline       float64    `json:"baseline"`
+	Reason         string     `json:"reason"`
+	Pulses         []pulseDTO `json:"pulses"`
+	ExcludedRanges []rangeDTO `json:"excluded_ranges"`
 }
 
 type errorDTO struct {
@@ -132,6 +138,18 @@ func main() {
 	run("Infinity token is located at sample index", c.scenarioElementInfinity)
 	run("unknown field is rejected and named", c.scenarioUnknownField)
 	run("malformed JSON is rejected", c.scenarioMalformed)
+	run("seam shielding recomputes baseline and severity from kept samples", c.scenarioExcludedSeam)
+	run("end-to-end: seam shielding, candidate break and range echo in one sample", c.scenarioExcludedCombined)
+	run("excluded interval breaks candidate merging even within 3 samples", c.scenarioExcludedBreak)
+	run("adopted excluded_ranges are echoed verbatim and in order", c.scenarioExcludedEcho)
+	run("omitted and empty excluded_ranges keep the legacy response byte-for-byte", c.scenarioExcludedLegacy)
+	run("legal boundary excluded_ranges are accepted and echoed", c.scenarioExcludedBoundaries)
+	run("inverted excluded range is located at its element index", c.scenarioExcludedInverted)
+	run("out-of-bounds excluded range is located at its element index", c.scenarioExcludedOutOfRange)
+	run("non-ascending excluded ranges are located at the element index", c.scenarioExcludedOrder)
+	run("overlapping excluded ranges are located at the element index", c.scenarioExcludedOverlap)
+	run("fewer than 64 kept samples is located at excluded_ranges", c.scenarioExcludedTooFew)
+	run("non-object excluded range element is located at the index", c.scenarioExcludedElementType)
 
 	fmt.Printf("\n%d/%d scenarios passed\n", total-failed, total)
 	if failed > 0 {
@@ -515,6 +533,277 @@ func (c *client) scenarioMalformed(a *assert.Assertions) {
 	a.Equal("invalid_json", e.Error)
 }
 
+// --- excluded_ranges scenarios ----------------------------------------------
+
+// seamSamples builds the wheel-seam end-to-end fixture: 130 samples with a
+// 65-sample high-amplitude seam block at [10,74] (30), a 4-sample bearing
+// burst at [80,83] (13) and 61 ordinary samples (2).
+func seamSamples() []float64 {
+	s := make([]float64, 130)
+	for i := range s {
+		s[i] = 2
+	}
+	for i := 10; i <= 74; i++ {
+		s[i] = 30
+	}
+	for i := 80; i <= 83; i++ {
+		s[i] = 13
+	}
+	return s
+}
+
+func (c *client) scenarioExcludedSeam(a *assert.Assertions) {
+	s := seamSamples()
+
+	// With the seam kept it dominates the even median: (13+30)/2 = 21.5 and
+	// the 13-burst stays below threshold -> undecidable.
+	full, _ := c.analyzeValues(a, 16000, s)
+	a.False(full.Decidable)
+	a.Equal(21.5, full.Baseline)
+	a.Equal("no_pulses", full.Reason)
+	a.Empty(full.Pulses)
+
+	// Shielding the seam recomputes baseline from the 65 kept samples
+	// (61 twos + 4 thirteens): median 2, threshold 12, so the burst is now a
+	// general pulse, and severity is also decided from kept samples.
+	resp, body := c.analyzeRanges(a, 16000, s, []rangeDTO{{Start: 10, End: 74}})
+	a.True(resp.Decidable, "body: %s", body)
+	a.Equal(2.0, resp.Baseline)
+	if a.Len(resp.Pulses, 1) {
+		p := resp.Pulses[0]
+		a.Equal(80, p.Start)
+		a.Equal(83, p.End)
+		a.Equal(80, p.PeakIndex)
+		a.Equal(13.0, p.Peak)
+		a.Equal("general", p.Severity)
+		a.Equal(2.0, p.Baseline)
+	}
+}
+
+func (c *client) scenarioExcludedCombined(a *assert.Assertions) {
+	// One signal, three requests, proving shielding, disconnection and echo.
+	//
+	// 130 samples: a 65-sample seam at 30 on [10,74], a 4-sample bearing
+	// burst at 13 on [80,83], two 2-sample 20-runs at [100,101] and
+	// [103,104] (a single-sample gap at 102), ordinary value 2 elsewhere.
+	s := seamSamples()
+	for _, i := range []int{100, 101, 103, 104} {
+		s[i] = 20
+	}
+
+	// 1) Nothing excluded: sorted multiset is 57 twos, 4 thirteens, 4
+	//    twenties and 65 thirties, so the even median is (20+30)/2 = 25;
+	//    threshold 150 leaves neither the 13-burst nor the 20-runs qualified.
+	full, body := c.analyzeValues(a, 16000, s)
+	a.Equal(25.0, full.Baseline, "body: %s", body)
+	a.False(full.Decidable)
+	a.Equal("no_pulses", full.Reason)
+	a.Empty(full.Pulses)
+
+	// 2) Shield only the seam: baseline drops to 2. The 13-burst is detected
+	//    and the two 20-runs merge across the one-sample gap (<= 3).
+	seamOnly, body := c.analyzeRanges(a, 16000, s, []rangeDTO{{Start: 10, End: 74}})
+	a.Equal(2.0, seamOnly.Baseline, "body: %s", body)
+	if a.Len(seamOnly.Pulses, 2) {
+		a.Equal(80, seamOnly.Pulses[0].Start)
+		a.Equal(83, seamOnly.Pulses[0].End)
+		a.Equal("general", seamOnly.Pulses[0].Severity)
+		a.Equal(100, seamOnly.Pulses[1].Start)
+		a.Equal(104, seamOnly.Pulses[1].End, "the 1-sample gap must normally merge")
+	}
+
+	// 3) Also exclude the single gap sample [102,102]: it becomes an
+	//    uncrossable boundary, so the two runs stay 2-sample candidates and
+	//    are filtered. Only the bearing burst survives. Exactly 64 samples
+	//    remain, and both adopted ranges are echoed verbatim.
+	adopted := []rangeDTO{{Start: 10, End: 74}, {Start: 102, End: 102}}
+	resp, body := c.analyzeRanges(a, 16000, s, adopted)
+	a.True(resp.Decidable, "body: %s", body)
+	a.Equal(2.0, resp.Baseline)
+	if a.Len(resp.Pulses, 1, "split candidates must be filtered: %s", body) {
+		a.Equal(80, resp.Pulses[0].Start)
+		a.Equal(83, resp.Pulses[0].End)
+		a.Equal(13.0, resp.Pulses[0].Peak)
+		a.Equal("general", resp.Pulses[0].Severity)
+	}
+	a.Equal(adopted, resp.ExcludedRanges, "adopted ranges echoed for point review")
+}
+
+func (c *client) scenarioExcludedBreak(a *assert.Assertions) {
+	// 68 samples: two 2-sample bursts with a 2-sample gap.
+	s := make([]float64, 68)
+	for i := range s {
+		s[i] = 2
+	}
+	for _, i := range []int{10, 11, 14, 15} {
+		s[i] = 20
+	}
+
+	// Gap of 2 (<= 3) normally merges them into one retained interval.
+	plain, _ := c.analyzeValues(a, 16000, s)
+	if a.Len(plain.Pulses, 1) {
+		a.Equal(10, plain.Pulses[0].Start)
+		a.Equal(15, plain.Pulses[0].End)
+	}
+
+	// Excluding the two gap samples makes the seam an uncrossable boundary:
+	// the pieces stay separate 2-sample candidates and both are filtered.
+	resp, body := c.analyzeRanges(a, 16000, s, []rangeDTO{{Start: 12, End: 13}})
+	a.False(resp.Decidable, "body: %s", body)
+	a.Equal("no_pulses", resp.Reason)
+	a.Empty(resp.Pulses)
+	// Echo is present even on an undecidable response, verbatim.
+	if a.Len(resp.ExcludedRanges, 1) {
+		a.Equal(rangeDTO{Start: 12, End: 13}, resp.ExcludedRanges[0])
+	}
+}
+
+func (c *client) scenarioExcludedEcho(a *assert.Assertions) {
+	// Quiet 200-sample signal with two disjoint excluded blocks; the response
+	// must echo the adopted ranges verbatim and in request order.
+	s := make([]float64, 200)
+	for i := range s {
+		s[i] = 2
+	}
+	want := []rangeDTO{{Start: 0, End: 9}, {Start: 100, End: 105}}
+	resp, body := c.analyzeRanges(a, 16000, s, want)
+	a.Equal(2.0, resp.Baseline, "body: %s", body)
+	if a.Len(resp.ExcludedRanges, 2) {
+		a.Equal(want[0], resp.ExcludedRanges[0])
+		a.Equal(want[1], resp.ExcludedRanges[1])
+	}
+}
+
+func (c *client) scenarioExcludedLegacy(a *assert.Assertions) {
+	zeros := zerosCSV(64)
+	bodies := make([]string, 3)
+	for i, tail := range []string{
+		``,
+		`,"excluded_ranges":[]`,
+		`,"excluded_ranges":null`,
+	} {
+		code, body := c.postRaw(a, fmt.Sprintf(
+			`{"sample_rate":16000,"amplitudes":[%s]%s}`, zeros, tail))
+		a.Equal(http.StatusOK, code, "body: %s", body)
+		bodies[i] = string(body)
+		a.NotContains(string(body), "excluded_ranges",
+			"legacy responses must not carry the optional field")
+	}
+	a.Equal(bodies[0], bodies[1], "empty array must be byte-identical to omitted")
+	a.Equal(bodies[0], bodies[2], "null must be byte-identical to omitted")
+}
+
+func (c *client) scenarioExcludedBoundaries(a *assert.Assertions) {
+	// 67 samples; point exclusions at both edges and one adjacent leave
+	// exactly 64 kept samples. Field contract locked end to end.
+	s := make([]float64, 67)
+	for i := range s {
+		s[i] = 2
+	}
+	for _, i := range []int{2, 3, 4, 5} {
+		s[i] = 20
+	}
+	want := []rangeDTO{{Start: 0, End: 0}, {Start: 1, End: 1}, {Start: 66, End: 66}}
+	resp, body := c.analyzeRanges(a, 16000, s, want)
+	a.True(resp.Decidable, "body: %s", body)
+	if a.Len(resp.Pulses, 1) {
+		a.Equal(2, resp.Pulses[0].Start)
+		a.Equal(5, resp.Pulses[0].End)
+	}
+	if a.Len(resp.ExcludedRanges, 3) {
+		a.Equal(want, resp.ExcludedRanges)
+	}
+}
+
+func (c *client) scenarioExcludedInverted(a *assert.Assertions) {
+	e := c.postRangesError(a, 64, `[{"start":10,"end":9}]`)
+	a.Equal("excluded_ranges", e.Field)
+	if a.NotNil(e.Index) {
+		a.Equal(0, *e.Index)
+	}
+	a.Equal("order", e.Constraint)
+}
+
+func (c *client) scenarioExcludedOutOfRange(a *assert.Assertions) {
+	// Endpoint at len(amplitudes) is outside the closed [0, n-1] domain.
+	e := c.postRangesError(a, 64, `[{"start":0,"end":64}]`)
+	a.Equal("excluded_ranges", e.Field)
+	if a.NotNil(e.Index) {
+		a.Equal(0, *e.Index)
+	}
+	a.Equal("range", e.Constraint)
+}
+
+func (c *client) scenarioExcludedOrder(a *assert.Assertions) {
+	e := c.postRangesError(a, 64, `[{"start":10,"end":11},{"start":9,"end":12}]`)
+	a.Equal("excluded_ranges", e.Field)
+	if a.NotNil(e.Index) {
+		a.Equal(1, *e.Index)
+	}
+	a.Equal("order", e.Constraint)
+}
+
+func (c *client) scenarioExcludedOverlap(a *assert.Assertions) {
+	e := c.postRangesError(a, 64, `[{"start":10,"end":20},{"start":20,"end":21}]`)
+	a.Equal("excluded_ranges", e.Field)
+	if a.NotNil(e.Index) {
+		a.Equal(1, *e.Index)
+	}
+	a.Equal("overlap", e.Constraint)
+}
+
+func (c *client) scenarioExcludedTooFew(a *assert.Assertions) {
+	// 64 samples minus one excluded leaves 63.
+	e := c.postRangesError(a, 64, `[{"start":63,"end":63}]`)
+	a.Equal("excluded_ranges", e.Field)
+	if a.NotNil(e.Index) {
+		a.Equal(0, *e.Index)
+	}
+	a.Equal("min_length", e.Constraint)
+}
+
+func (c *client) scenarioExcludedElementType(a *assert.Assertions) {
+	// A bare number, a null element, and a non-integer endpoint are each
+	// located at their element index with constraint "type".
+	for _, tc := range []struct {
+		name   string
+		ranges string
+		index  int
+	}{
+		{"number element", `[5]`, 0},
+		{"null element", `[{"start":0,"end":0},null]`, 1},
+		{"fractional endpoint", `[{"start":1.5,"end":3}]`, 0},
+		{"string endpoint", `[{"start":"2","end":3}]`, 0},
+	} {
+		e := c.postRangesError(a, 64, tc.ranges)
+		if !a.Equal("excluded_ranges", e.Field, tc.name) {
+			continue
+		}
+		if a.NotNil(e.Index, tc.name) {
+			a.Equal(tc.index, *e.Index, tc.name)
+		}
+		a.Equal("type", e.Constraint, tc.name)
+	}
+
+	// A non-array excluded_ranges is a field-level type error without index.
+	raw := fmt.Sprintf(`{"sample_rate":16000,"amplitudes":[%s],"excluded_ranges":{"start":1,"end":2}}`,
+		zerosCSV(64))
+	code, body := c.postRaw(a, raw)
+	a.Equal(http.StatusBadRequest, code)
+	e := decodeError(a, body)
+	a.Equal("excluded_ranges", e.Field)
+	a.Nil(e.Index)
+	a.Equal("type", e.Constraint)
+}
+
+func (c *client) postRangesError(a *assert.Assertions, n int, rangesJSON string) errorDTO {
+	raw := fmt.Sprintf(`{"sample_rate":16000,"amplitudes":[%s],"excluded_ranges":%s}`,
+		zerosCSV(n), rangesJSON)
+	code, body := c.postRaw(a, raw)
+	a.Equal(http.StatusBadRequest, code, "body: %s", body)
+	return decodeError(a, body)
+}
+
 // --- HTTP helpers -----------------------------------------------------------
 
 func (c *client) waitHealthy(timeout time.Duration) error {
@@ -558,6 +847,28 @@ func (c *client) analyzeValues(a *assert.Assertions, rate float64, samples []flo
 		SampleRate float64   `json:"sample_rate"`
 		Amplitudes []float64 `json:"amplitudes"`
 	}{rate, samples})
+	if !a.NoError(err) {
+		return analyzeDTO{}, nil
+	}
+	code, body := c.postRaw(a, string(payload))
+	a.Equal(http.StatusOK, code, "body: %s", body)
+
+	var resp analyzeDTO
+	if !a.NoError(json.Unmarshal(body, &resp)) {
+		return analyzeDTO{}, body
+	}
+	a.Equal(rate, resp.SampleRate)
+	a.NotNil(resp.Pulses)
+	return resp, body
+}
+
+// analyzeRanges posts a request carrying excluded_ranges and expects 200.
+func (c *client) analyzeRanges(a *assert.Assertions, rate float64, samples []float64, ranges []rangeDTO) (analyzeDTO, []byte) {
+	payload, err := json.Marshal(struct {
+		SampleRate     float64    `json:"sample_rate"`
+		Amplitudes     []float64  `json:"amplitudes"`
+		ExcludedRanges []rangeDTO `json:"excluded_ranges"`
+	}{rate, samples, ranges})
 	if !a.NoError(err) {
 		return analyzeDTO{}, nil
 	}

@@ -32,6 +32,30 @@ func flatBody(t *testing.T, rate float64, n int, set map[int]float64) []byte {
 	return body
 }
 
+// seamFixture builds the end-to-end sample: 130 samples with a high-amplitude
+// wheel-seam block at [10,74] (value 30), a 4-sample bearing burst at
+// [80,83] (value 13) and 61 ordinary samples at 2. With the seam kept the
+// median is 21.5 and nothing crosses the threshold; with the seam excluded the
+// baseline drops to 2 and the burst becomes a general pulse.
+func seamFixture() []float64 {
+	s := make([]float64, 130)
+	for i := range s {
+		s[i] = 2
+	}
+	for i := 10; i <= 74; i++ {
+		s[i] = 30
+	}
+	for i := 80; i <= 83; i++ {
+		s[i] = 13
+	}
+	return s
+}
+
+type rawRangeDTO struct {
+	Start int `json:"start"`
+	End   int `json:"end"`
+}
+
 func post(t *testing.T, r http.Handler, body []byte) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/pulses/analyze", bytes.NewReader(body))
@@ -278,3 +302,273 @@ func TestHealthz(t *testing.T) {
 	r.ServeHTTP(w, req)
 	assert.Equal(t, http.StatusOK, w.Code)
 }
+
+// --- excluded_ranges contract ------------------------------------------------
+
+func TestAnalyze_ExcludedRangesEchoAndResult(t *testing.T) {
+	r := NewRouter()
+	body, err := json.Marshal(map[string]any{
+		"sample_rate":     16000.0,
+		"amplitudes":      seamFixture(),
+		"excluded_ranges": []map[string]int{{"start": 10, "end": 74}},
+	})
+	require.NoError(t, err)
+	w := post(t, r, body)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var resp struct {
+		AnalyzeResponse
+		ExcludedRanges []rawRangeDTO `json:"excluded_ranges"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.True(t, resp.Decidable)
+	assert.Equal(t, 2.0, resp.Baseline)
+	require.Len(t, resp.Pulses, 1)
+	p := resp.Pulses[0]
+	assert.Equal(t, 80, p.Start)
+	assert.Equal(t, 83, p.End)
+	assert.Equal(t, 13.0, p.Peak)
+	assert.Equal(t, "general", string(p.Severity))
+
+	// The adopted ranges are echoed verbatim for point-by-point review.
+	require.Len(t, resp.ExcludedRanges, 1)
+	assert.Equal(t, rawRangeDTO{Start: 10, End: 74}, resp.ExcludedRanges[0])
+}
+
+func TestAnalyze_ExcludedRangesMultipleEchoedInOrder(t *testing.T) {
+	r := NewRouter()
+	// A 200-sample quiet signal; exclude two disjoint blocks; the response
+	// must echo exactly what was adopted, in request order.
+	samples := make([]float64, 200)
+	for i := range samples {
+		samples[i] = 2
+	}
+	for i := 100; i <= 105; i++ {
+		samples[i] = 30
+	}
+	body, err := json.Marshal(map[string]any{
+		"sample_rate": 16000.0,
+		"amplitudes":  samples,
+		"excluded_ranges": []map[string]int{
+			{"start": 0, "end": 9},
+			{"start": 100, "end": 105},
+		},
+	})
+	require.NoError(t, err)
+	w := post(t, r, body)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var resp struct {
+		ExcludedRanges []rawRangeDTO `json:"excluded_ranges"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.ExcludedRanges, 2)
+	assert.Equal(t, rawRangeDTO{0, 9}, resp.ExcludedRanges[0])
+	assert.Equal(t, rawRangeDTO{100, 105}, resp.ExcludedRanges[1])
+}
+
+func TestAnalyze_ExcludedRangesBreakCandidatesAcrossGap(t *testing.T) {
+	r := NewRouter()
+	// Two 2-sample bursts separated by two samples ([12,13]): gap <= 3 would
+	// normally merge them into a retained 6-sample interval. Excluding the
+	// gap samples forces separate 2-sample candidates, both filtered.
+	// 68 samples keep 66 valid samples after the 2-sample exclusion.
+	s := make([]float64, 68)
+	for i := range s {
+		s[i] = 2
+	}
+	for _, i := range []int{10, 11, 14, 15} {
+		s[i] = 20
+	}
+	body, err := json.Marshal(map[string]any{
+		"sample_rate":     16000.0,
+		"amplitudes":      s,
+		"excluded_ranges": []map[string]int{{"start": 12, "end": 13}},
+	})
+	require.NoError(t, err)
+
+	// Without the exclusion the bursts merge and survive.
+	plainBody, _ := json.Marshal(map[string]any{"sample_rate": 16000.0, "amplitudes": s})
+	plain := post(t, r, plainBody)
+	require.Equal(t, http.StatusOK, plain.Code)
+	var plainResp AnalyzeResponse
+	require.NoError(t, json.Unmarshal(plain.Body.Bytes(), &plainResp))
+	require.Len(t, plainResp.Pulses, 1)
+
+	// With the exclusion both pieces are filtered.
+	w := post(t, r, body)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var resp AnalyzeResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.False(t, resp.Decidable)
+	assert.Equal(t, "no_pulses", resp.Reason)
+	assert.Empty(t, resp.Pulses)
+}
+
+func TestAnalyze_ExcludedRangesOmittedOrEmptyKeepsContract(t *testing.T) {
+	r := NewRouter()
+	set := map[int]float64{5: 13, 6: 25, 7: 13, 8: 13}
+
+	omitted, err := json.Marshal(map[string]any{
+		"sample_rate": 16000.0, "amplitudes": fillAPI(64, 2, set),
+	})
+	require.NoError(t, err)
+	empty, err := json.Marshal(map[string]any{
+		"sample_rate": 16000.0, "amplitudes": fillAPI(64, 2, set),
+		"excluded_ranges": []any{},
+	})
+	require.NoError(t, err)
+
+	omittedBody := post(t, r, omitted).Body.String()
+	emptyBody := post(t, r, empty).Body.String()
+
+	// An explicit null means "not provided" for this optional field.
+	nullBodyReq, _ := json.Marshal(map[string]any{
+		"sample_rate": 16000.0, "amplitudes": fillAPI(64, 2, set),
+		"excluded_ranges": nil,
+	})
+	assert.Equal(t, omittedBody, post(t, r, nullBodyReq).Body.String())
+
+	// Field-for-field identical responses, and the field itself is absent
+	// (omitempty) in both so existing clients see the legacy contract.
+	assert.Equal(t, omittedBody, emptyBody)
+	assert.NotContains(t, omittedBody, "excluded_ranges")
+	assert.NotContains(t, emptyBody, "excluded_ranges")
+
+	var resp AnalyzeResponse
+	require.NoError(t, json.Unmarshal([]byte(omittedBody), &resp))
+	assert.True(t, resp.Decidable)
+	assert.Equal(t, 2.0, resp.Baseline)
+	require.Len(t, resp.Pulses, 1)
+	assert.Equal(t, 25.0, resp.Pulses[0].Peak)
+	assert.Nil(t, resp.ExcludedRanges)
+}
+
+func fillAPI(n int, base float64, set map[int]float64) []float64 {
+	s := make([]float64, n)
+	for i := range s {
+		s[i] = base
+		if v, ok := set[i]; ok {
+			s[i] = v
+		}
+	}
+	return s
+}
+
+func TestAnalyze_ExcludedRangesBoundaryInputs(t *testing.T) {
+	r := NewRouter()
+	// Legal boundaries locked by the processor: point ranges at both edges
+	// and adjacent ranges leaving exactly 64 kept samples out of 67.
+	samples := make([]float64, 67)
+	for i := range samples {
+		samples[i] = 2
+	}
+	for _, i := range []int{2, 3, 4, 5} {
+		samples[i] = 20
+	}
+	body, err := json.Marshal(map[string]any{
+		"sample_rate": 16000.0,
+		"amplitudes":  samples,
+		"excluded_ranges": []map[string]int{
+			{"start": 0, "end": 0},
+			{"start": 1, "end": 1},
+			{"start": 66, "end": 66},
+		},
+	})
+	require.NoError(t, err)
+	w := post(t, r, body)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var resp AnalyzeResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.True(t, resp.Decidable)
+	require.Len(t, resp.Pulses, 1)
+	assert.Equal(t, 2, resp.Pulses[0].Start)
+	assert.Equal(t, 5, resp.Pulses[0].End)
+}
+
+func TestValidation_ExcludedRanges(t *testing.T) {
+	r := NewRouter()
+
+	postRanges := func(t *testing.T, rangesJSON string, n int) *httptest.ResponseRecorder {
+		t.Helper()
+		raw := fmt.Sprintf(`{"sample_rate":16000,"amplitudes":[%s],"excluded_ranges":%s}`,
+			strings.Repeat("0,", n-1)+"0", rangesJSON)
+		return postRaw(t, r, raw)
+	}
+
+	for _, tc := range []struct {
+		name       string
+		n          int
+		ranges     string
+		index      *int
+		constraint string
+		field      string
+	}{
+		{name: "inverted", n: 64, ranges: `[{"start":10,"end":9}]`,
+			index: intPtrVal(0), constraint: "order"},
+		{name: "end past last sample", n: 64, ranges: `[{"start":0,"end":64}]`,
+			index: intPtrVal(0), constraint: "range"},
+		{name: "negative start", n: 64, ranges: `[{"start":-1,"end":3}]`,
+			index: intPtrVal(0), constraint: "range"},
+		{name: "starts not ascending", n: 64, ranges: `[{"start":10,"end":11},{"start":9,"end":12}]`,
+			index: intPtrVal(1), constraint: "order"},
+		{name: "overlap", n: 64, ranges: `[{"start":10,"end":20},{"start":20,"end":21}]`,
+			index: intPtrVal(1), constraint: "overlap"},
+		{name: "overlap at second offender", n: 64,
+			ranges: `[{"start":0,"end":0},{"start":5,"end":5},{"start":5,"end":6}]`,
+			index:  intPtrVal(2), constraint: "overlap"},
+		{name: "fewer than 64 remain", n: 64, ranges: `[{"start":63,"end":63}]`,
+			index: intPtrVal(0), constraint: "min_length"},
+		{name: "element not object", n: 64, ranges: `[5]`,
+			index: intPtrVal(0), constraint: "type"},
+		{name: "bare NaN element", n: 64, ranges: `[1,{"start":0,"end":0},NaN]`,
+			index: intPtrVal(2), constraint: "type"},
+		{name: "null element", n: 64, ranges: `[null]`,
+			index: intPtrVal(0), constraint: "type"},
+		{name: "missing start", n: 64, ranges: `[{"end":3}]`,
+			index: intPtrVal(0), constraint: "required"},
+		{name: "missing end", n: 64, ranges: `[{"start":3}]`,
+			index: intPtrVal(0), constraint: "required"},
+		{name: "non integer start", n: 64, ranges: `[{"start":1.5,"end":3}]`,
+			index: intPtrVal(0), constraint: "type"},
+		{name: "string start", n: 64, ranges: `[{"start":"3","end":4}]`,
+			index: intPtrVal(0), constraint: "type"},
+		{name: "unknown element field", n: 64, ranges: `[{"start":1,"end":2,"x":1}]`,
+			index: intPtrVal(0), constraint: "unknown"},
+		{name: "not an array", n: 64, ranges: `{"start":1,"end":2}`,
+			index: nil, constraint: "type"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := postRanges(t, tc.ranges, tc.n)
+			assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+			var fe FieldError
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &fe))
+			assert.Equal(t, "validation_failed", fe.Error)
+			assert.Equal(t, "excluded_ranges", fe.Field)
+			assert.Equal(t, tc.constraint, fe.Constraint)
+			if tc.index == nil {
+				assert.Nil(t, fe.Index, "field-level error must carry no index: %s", fe.Message)
+			} else {
+				require.NotNil(t, fe.Index)
+				assert.Equal(t, *tc.index, *fe.Index)
+			}
+			assert.NotEmpty(t, fe.Message)
+		})
+	}
+}
+
+func TestValidation_ExcludedRangesNaNLocated(t *testing.T) {
+	r := NewRouter()
+	raw := fmt.Sprintf(`{"sample_rate":16000,"amplitudes":[%s],"excluded_ranges":[{"start":NaN,"end":3}]}`,
+		strings.Repeat("0,", 63)+"0")
+	w := postRaw(t, r, raw)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	var fe FieldError
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &fe))
+	assert.Equal(t, "excluded_ranges", fe.Field)
+	require.NotNil(t, fe.Index)
+	assert.Equal(t, 0, *fe.Index)
+	assert.Equal(t, "type", fe.Constraint)
+}
+
+func intPtrVal(i int) *int { return &i }
