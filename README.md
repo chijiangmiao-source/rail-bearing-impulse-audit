@@ -45,8 +45,9 @@
 ## 可选脉冲度量（`include_metrics`）
 
 车辆段工程师定位脉冲后还需比较冲击持续时间与区间整体振幅。单通道分析接受可选
-开关 `include_metrics`：**只接受 JSON 布尔值**；未传、`null` 或 `false` 时响应与
-旧版逐字段一致（不出现度量字段），传 `true` 时每个已保留脉冲追加两个字段：
+开关 `include_metrics`：**只接受 JSON 布尔值**（`null` 与其他非布尔值一样按
+`type` 错误定位拒绝）；未传或 `false` 时响应与旧版逐字段一致（不出现度量字段），
+传 `true` 时每个已保留脉冲追加两个字段：
 
 - `duration_ms`：冲击持续时间，按闭区间样本数（`end-start+1`）除以请求采样率
   再换算为毫秒；
@@ -65,7 +66,7 @@
 | `sample_rate` | JSON number | 有限浮点，闭区间 `[1000, 48000]` Hz |
 | `amplitudes` | number 数组 | 长度闭区间 `[64, 20000]`，每个元素必须是有限浮点 |
 | `excluded_ranges` | 对象数组，可选 | 每项 `{"start":int,"end":int}`；端点落在 `[0, len(amplitudes)-1]`、`start <= end`、按 `start` 升序、互不重叠（可相邻）；排除后剩余样本 `≥ 64`。未传、`null` 或 `[]` 均表示不屏蔽 |
-| `include_metrics` | JSON boolean，可选 | 只接受 `true`/`false`；未传、`null` 或 `false` 等价于关闭。开启后每个已保留脉冲追加 `duration_ms` 与 `rms_amplitude` |
+| `include_metrics` | JSON boolean，可选 | 只接受 `true`/`false`；未传或 `false` 等价于关闭；`null` 与其他非布尔值均为 `type` 错误。开启后每个已保留脉冲追加 `duration_ms` 与 `rms_amplitude` |
 
 非法请求返回 `400`，错误**定位到字段或样本下标**：
 

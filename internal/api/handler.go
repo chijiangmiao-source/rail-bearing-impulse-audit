@@ -25,7 +25,7 @@ type AnalyzeRequest struct {
 	Amplitudes     []float64     `json:"amplitudes"`
 	ExcludedRanges []pulse.Range `json:"excluded_ranges,omitempty"`
 	// IncludeMetrics switches on per-pulse duration_ms/rms_amplitude in the
-	// response. Omitted, null or false keeps the legacy response shape.
+	// response. Omitted or false keeps the legacy response shape.
 	IncludeMetrics bool `json:"include_metrics,omitempty"`
 }
 
@@ -52,11 +52,14 @@ func (e *FieldError) HTTPStatus() int { return http.StatusBadRequest }
 
 // rawAnalyzeRequest keeps the fields as raw tokens so type errors can be
 // attributed to the field or to an individual amplitude/range index.
+// IncludeMetrics is a non-pointer RawMessage so an explicit null is
+// distinguishable from an absent key: null is not a boolean and must be
+// rejected, not treated as "field omitted".
 type rawAnalyzeRequest struct {
 	SampleRate     *json.RawMessage `json:"sample_rate"`
 	Amplitudes     *json.RawMessage `json:"amplitudes"`
 	ExcludedRanges *json.RawMessage `json:"excluded_ranges"`
-	IncludeMetrics *json.RawMessage `json:"include_metrics"`
+	IncludeMetrics json.RawMessage  `json:"include_metrics"`
 }
 
 // NewRouter builds the HTTP router.
@@ -161,8 +164,8 @@ func decodeAnalyzeRequest(r *http.Request) (*AnalyzeRequest, *FieldError) {
 	}
 
 	includeMetrics := false
-	if raw.IncludeMetrics != nil {
-		includeMetrics, ferr = parseIncludeMetrics(*raw.IncludeMetrics)
+	if len(raw.IncludeMetrics) != 0 {
+		includeMetrics, ferr = parseIncludeMetrics(raw.IncludeMetrics)
 		if ferr != nil {
 			return nil, ferr
 		}
@@ -269,18 +272,25 @@ func amplitudeTypeError(i int) *FieldError {
 }
 
 // parseIncludeMetrics converts the optional metrics switch. Only a JSON
-// boolean is accepted; anything else is a field-level type error. A JSON
-// null never reaches here: it leaves the outer pointer nil and is treated
-// as "field omitted", exactly like an absent switch.
+// boolean is accepted: an explicit null, like any other non-boolean token,
+// is a field-level type error (unmarshaling null into a bool would
+// otherwise silently succeed). An absent key never reaches here.
 func parseIncludeMetrics(token json.RawMessage) (bool, *FieldError) {
+	if isNull(token) {
+		return false, includeMetricsTypeError()
+	}
 	var v bool
 	if err := json.Unmarshal(token, &v); err != nil {
-		return false, &FieldError{
-			Error: "validation_failed", Field: "include_metrics",
-			Constraint: "type", Message: "include_metrics must be a JSON boolean",
-		}
+		return false, includeMetricsTypeError()
 	}
 	return v, nil
+}
+
+func includeMetricsTypeError() *FieldError {
+	return &FieldError{
+		Error: "validation_failed", Field: "include_metrics",
+		Constraint: "type", Message: "include_metrics must be a JSON boolean",
+	}
 }
 
 // parseExcludedRanges parses and validates excluded_ranges against an

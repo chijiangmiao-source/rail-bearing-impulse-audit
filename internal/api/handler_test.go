@@ -660,7 +660,6 @@ func TestAnalyze_IncludeMetricsOffKeepsLegacyBody(t *testing.T) {
 	omitted := post(t, r, mk(nil)).Body.String()
 	for _, extra := range []map[string]any{
 		{"include_metrics": false},
-		{"include_metrics": nil}, // explicit null means "not provided"
 	} {
 		body := post(t, r, mk(extra)).Body.String()
 		assert.Equal(t, omitted, body, "switch off must keep the legacy body: %v", extra)
@@ -673,9 +672,10 @@ func TestValidation_IncludeMetricsType(t *testing.T) {
 	r := NewRouter()
 	zeros := strings.Repeat("0,", 63) + "0"
 
-	// Only a JSON boolean is legal; every other token (including the
-	// non-finite literals) is a type error located at include_metrics.
-	for _, token := range []string{`"true"`, "1", "0", "1.5", "[]", "{}", "NaN", "Infinity"} {
+	// Only a JSON boolean is legal; every other token (an explicit null, the
+	// non-finite literals, numbers, strings, containers) is a type error
+	// located at include_metrics.
+	for _, token := range []string{"null", `"true"`, "1", "0", "1.5", "[]", "{}", "NaN", "Infinity"} {
 		t.Run(token, func(t *testing.T) {
 			w := postRaw(t, r, fmt.Sprintf(
 				`{"sample_rate":16000,"amplitudes":[%s],"include_metrics":%s}`, zeros, token))

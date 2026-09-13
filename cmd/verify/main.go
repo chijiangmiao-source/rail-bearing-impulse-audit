@@ -962,9 +962,10 @@ func (c *client) scenarioMetricsHugeFinite(a *assert.Assertions) {
 }
 
 func (c *client) scenarioMetricsSwitchType(a *assert.Assertions) {
-	// The switch accepts only a JSON boolean; every other token is a type
-	// error located at include_metrics with no sample index.
-	for _, token := range []string{`"true"`, "1", "0", "1.5", "[]", "{}", "NaN", "Infinity"} {
+	// The switch accepts only a JSON boolean; every other token — including
+	// an explicit null — is a type error located at include_metrics with no
+	// sample index.
+	for _, token := range []string{"null", `"true"`, "1", "0", "1.5", "[]", "{}", "NaN", "Infinity"} {
 		raw := fmt.Sprintf(`{"sample_rate":16000,"amplitudes":[%s],"include_metrics":%s}`,
 			zerosCSV(64), token)
 		code, body := c.postRaw(a, raw)
@@ -986,10 +987,10 @@ func (c *client) scenarioMetricsCompatibility(a *assert.Assertions) {
 		return
 	}
 
-	// Omitted, false and null switches are byte-identical to one another
-	// and carry no metric fields: existing clients see the legacy contract.
+	// Omitted and false switches are byte-identical to each other and carry
+	// no metric fields: existing clients see the legacy contract.
 	baseline := ""
-	for i, tail := range []string{``, `,"include_metrics":false`, `,"include_metrics":null`} {
+	for i, tail := range []string{``, `,"include_metrics":false`} {
 		code, body := c.postRaw(a, fmt.Sprintf(
 			`{"sample_rate":16000,"amplitudes":%s%s}`, samplesJSON, tail))
 		a.Equal(http.StatusOK, code, "body: %s", body)
