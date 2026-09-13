@@ -305,6 +305,33 @@ func TestCorrelate_DeterministicBody(t *testing.T) {
 	}
 }
 
+func TestCorrelate_ResponseNeverCarriesMetrics(t *testing.T) {
+	r := NewRouter()
+	body, err := json.Marshal(map[string]any{
+		"tolerance_samples": 5,
+		"left":              channelEnvelope(16000, dualBursts()),
+		"right":             channelEnvelope(16000, dualBursts()),
+	})
+	require.NoError(t, err)
+	w := postCorrelate(t, r, body)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.NotContains(t, w.Body.String(), "duration_ms")
+	assert.NotContains(t, w.Body.String(), "rms_amplitude")
+
+	// include_metrics is not part of the dual-channel contract: inside a
+	// side it is an unknown field, located with the side prefix.
+	zeros := strings.Repeat("0,", 63) + "0"
+	raw := fmt.Sprintf(`{"tolerance_samples":1,`+
+		`"left":{"sample_rate":16000,"amplitudes":[%s],"include_metrics":true},`+
+		`"right":{"sample_rate":16000,"amplitudes":[%s]}}`, zeros, zeros)
+	w = postCorrelateRaw(t, r, raw)
+	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	var fe FieldError
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &fe))
+	assert.Equal(t, "left.include_metrics", fe.Field)
+	assert.Equal(t, "unknown", fe.Constraint)
+}
+
 // --- validation contract -----------------------------------------------------
 
 func TestValidation_CorrelateTolerance(t *testing.T) {

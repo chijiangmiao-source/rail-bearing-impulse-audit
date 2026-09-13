@@ -6,7 +6,7 @@
 
 - 语言/框架：Go 1.25、Gin、testify
 - 部署：Docker + Docker Compose（多阶段构建，distroless 运行镜像）
-- 验收：内置名为 `verify` 的一次性验收服务，65 个契约场景
+- 验收：内置名为 `verify` 的一次性验收服务，69 个契约场景
 
 ---
 
@@ -42,6 +42,22 @@
   便于逐点复核。未传字段或传 `[]`/`null` 时，请求与响应与旧版逐字段一致
   （响应中不出现该字段）。
 
+## 可选脉冲度量（`include_metrics`）
+
+车辆段工程师定位脉冲后还需比较冲击持续时间与区间整体振幅。单通道分析接受可选
+开关 `include_metrics`：**只接受 JSON 布尔值**；未传、`null` 或 `false` 时响应与
+旧版逐字段一致（不出现度量字段），传 `true` 时每个已保留脉冲追加两个字段：
+
+- `duration_ms`：冲击持续时间，按闭区间样本数（`end-start+1`）除以请求采样率
+  再换算为毫秒；
+- `rms_amplitude`：区间内**全部样本**的均方根振幅，采用缩放平方和算法
+  （先除以区间最大幅值再平方求和），接近浮点上界的有限振幅也不会因中间平方
+  溢出而产生无穷值。
+
+基线为零或没有保留脉冲时仍返回原不可判定结果与空列表，**不伪造度量**。
+该开关仅属于单通道接口：双通道关联入口不接受 `include_metrics`（在一侧出现
+按未知字段拒绝），其左右分析结果也不出现度量字段，现有客户端无需调整。
+
 ## 输入约束
 
 | 字段 | 类型 | 约束 |
@@ -49,6 +65,7 @@
 | `sample_rate` | JSON number | 有限浮点，闭区间 `[1000, 48000]` Hz |
 | `amplitudes` | number 数组 | 长度闭区间 `[64, 20000]`，每个元素必须是有限浮点 |
 | `excluded_ranges` | 对象数组，可选 | 每项 `{"start":int,"end":int}`；端点落在 `[0, len(amplitudes)-1]`、`start <= end`、按 `start` 升序、互不重叠（可相邻）；排除后剩余样本 `≥ 64`。未传、`null` 或 `[]` 均表示不屏蔽 |
+| `include_metrics` | JSON boolean，可选 | 只接受 `true`/`false`；未传、`null` 或 `false` 等价于关闭。开启后每个已保留脉冲追加 `duration_ms` 与 `rms_amplitude` |
 
 非法请求返回 `400`，错误**定位到字段或样本下标**：
 
@@ -122,6 +139,29 @@ order | overlap | unknown`：
 - `baseline`：参与判定样本的绝对中位数（屏蔽时只算剩余样本），顶层与每个脉冲各回显一次，便于逐点复核。
 - `excluded_ranges`：仅在请求显式给出非空数组时出现，原样回显实际采用的区间。
 - 不可判定时：`decidable=false`、`reason` 为 `baseline_zero`/`no_pulses`、`pulses=[]`。
+
+请求携带 `"include_metrics": true` 时，每个已保留脉冲追加 `duration_ms` 与
+`rms_amplitude`：
+
+```json
+{
+  "sample_rate": 16000,
+  "decidable": true,
+  "baseline": 2,
+  "pulses": [
+    {
+      "start": 5,
+      "end": 8,
+      "peak_index": 6,
+      "peak": 25,
+      "severity": "severe",
+      "baseline": 2,
+      "duration_ms": 0.25,
+      "rms_amplitude": 16.822603841260722
+    }
+  ]
+}
+```
 
 另有 `GET /healthz` 存活探针。
 
@@ -217,7 +257,7 @@ go run ./cmd/verify -base-url http://127.0.0.1:8080
 # 构建并后台启动 API；宿主端口可用 API_PORT 覆盖
 API_PORT=9090 docker compose up --build -d
 
-# 一次性验收服务（等待 API 健康后运行 65 个场景，退出码 0/1）
+# 一次性验收服务（等待 API 健康后运行 69 个场景，退出码 0/1）
 docker compose run --rm verify
 
 # 或者构建后一起拉起，verify 跑完即退出
@@ -232,8 +272,8 @@ docker compose up --build
 
 ```
 cmd/api/main.go          HTTP 服务入口（含 -healthcheck 探针）
-cmd/verify/main.go       一次性验收服务（testify 断言，65 个场景）
-internal/pulse/          检测算法：单通道接缝屏蔽/基线/候选/合并/过滤/峰值/等级；双通道配对
+cmd/verify/main.go       一次性验收服务（testify 断言，69 个场景）
+internal/pulse/          检测算法：单通道接缝屏蔽/基线/候选/合并/过滤/峰值/等级、可选脉冲度量；双通道配对
 internal/api/            Gin 路由、JSON 解码与字段/下标级校验；双通道关联处理器与左右前缀定位
 Dockerfile               golang:1.25 多阶段构建 → distroless 静态镜像
 docker-compose.yml       api 服务 + verify 一次性验收服务

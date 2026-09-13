@@ -24,6 +24,9 @@ type AnalyzeRequest struct {
 	SampleRate     float64       `json:"sample_rate"`
 	Amplitudes     []float64     `json:"amplitudes"`
 	ExcludedRanges []pulse.Range `json:"excluded_ranges,omitempty"`
+	// IncludeMetrics switches on per-pulse duration_ms/rms_amplitude in the
+	// response. Omitted, null or false keeps the legacy response shape.
+	IncludeMetrics bool `json:"include_metrics,omitempty"`
 }
 
 // AnalyzeResponse is the full, deterministic response contract.
@@ -53,6 +56,7 @@ type rawAnalyzeRequest struct {
 	SampleRate     *json.RawMessage `json:"sample_rate"`
 	Amplitudes     *json.RawMessage `json:"amplitudes"`
 	ExcludedRanges *json.RawMessage `json:"excluded_ranges"`
+	IncludeMetrics *json.RawMessage `json:"include_metrics"`
 }
 
 // NewRouter builds the HTTP router.
@@ -79,7 +83,14 @@ func analyzeHandler(c *gin.Context) {
 		return
 	}
 
-	result := pulse.Analyze(req.Amplitudes, req.ExcludedRanges...)
+	// Metrics are opt-in: with the switch off the analysis is the legacy one
+	// and the response stays field-for-field identical.
+	var result pulse.Result
+	if req.IncludeMetrics {
+		result = pulse.AnalyzeWithMetrics(req.Amplitudes, req.SampleRate, req.ExcludedRanges...)
+	} else {
+		result = pulse.Analyze(req.Amplitudes, req.ExcludedRanges...)
+	}
 	c.JSON(http.StatusOK, AnalyzeResponse{
 		SampleRate:     req.SampleRate,
 		Decidable:      result.Decidable,
@@ -149,10 +160,19 @@ func decodeAnalyzeRequest(r *http.Request) (*AnalyzeRequest, *FieldError) {
 		}
 	}
 
+	includeMetrics := false
+	if raw.IncludeMetrics != nil {
+		includeMetrics, ferr = parseIncludeMetrics(*raw.IncludeMetrics)
+		if ferr != nil {
+			return nil, ferr
+		}
+	}
+
 	return &AnalyzeRequest{
 		SampleRate:     sampleRate,
 		Amplitudes:     amplitudes,
 		ExcludedRanges: ranges,
+		IncludeMetrics: includeMetrics,
 	}, nil
 }
 
@@ -246,6 +266,21 @@ func amplitudeTypeError(i int) *FieldError {
 		Index: intPtr(i), Constraint: "type",
 		Message: fmt.Sprintf("amplitudes[%d] must be a finite JSON number", i),
 	}
+}
+
+// parseIncludeMetrics converts the optional metrics switch. Only a JSON
+// boolean is accepted; anything else is a field-level type error. A JSON
+// null never reaches here: it leaves the outer pointer nil and is treated
+// as "field omitted", exactly like an absent switch.
+func parseIncludeMetrics(token json.RawMessage) (bool, *FieldError) {
+	var v bool
+	if err := json.Unmarshal(token, &v); err != nil {
+		return false, &FieldError{
+			Error: "validation_failed", Field: "include_metrics",
+			Constraint: "type", Message: "include_metrics must be a JSON boolean",
+		}
+	}
+	return v, nil
 }
 
 // parseExcludedRanges parses and validates excluded_ranges against an
@@ -509,6 +544,13 @@ func nonFiniteAnalyze(stack []frame, pendingKey string) *FieldError {
 			return &FieldError{
 				Error: "validation_failed", Field: "sample_rate",
 				Constraint: "finite", Message: "sample_rate must be finite",
+			}
+		}
+		// A non-finite literal where only a boolean is legal.
+		if top.kind == '{' && pendingKey == "include_metrics" {
+			return &FieldError{
+				Error: "validation_failed", Field: "include_metrics",
+				Constraint: "type", Message: "include_metrics must be a JSON boolean",
 			}
 		}
 		// A start/end value inside an excluded_ranges element object.

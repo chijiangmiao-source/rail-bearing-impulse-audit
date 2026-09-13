@@ -51,6 +51,11 @@ type Pulse struct {
 	Severity Severity `json:"severity"`
 	// Baseline is the whole-sequence absolute median used for this pulse.
 	Baseline float64 `json:"baseline"`
+	// DurationMS and RMSAmplitude are the optional per-pulse metrics. Only
+	// AnalyzeWithMetrics sets them; every other analysis leaves them nil so
+	// the JSON contract is unchanged when metrics are not requested.
+	DurationMS   *float64 `json:"duration_ms,omitempty"`
+	RMSAmplitude *float64 `json:"rms_amplitude,omitempty"`
 }
 
 // Result is the full analysis outcome.

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -588,3 +589,104 @@ func TestValidation_ExcludedRangesNaNLocated(t *testing.T) {
 }
 
 func intPtrVal(i int) *int { return &i }
+
+// --- include_metrics contract -------------------------------------------------
+
+func TestAnalyze_IncludeMetricsReturnsMetrics(t *testing.T) {
+	r := NewRouter()
+	// 4-sample pulse [5,8] (13, 25, 13, 13) at 16 kHz: duration 0.25 ms,
+	// RMS sqrt((13² + 25² + 13² + 13²)/4) = sqrt(283).
+	body, err := json.Marshal(map[string]any{
+		"sample_rate":     16000.0,
+		"amplitudes":      fillAPI(64, 2, map[int]float64{5: 13, 6: 25, 7: 13, 8: 13}),
+		"include_metrics": true,
+	})
+	require.NoError(t, err)
+	w := post(t, r, body)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var resp AnalyzeResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.True(t, resp.Decidable)
+	require.Len(t, resp.Pulses, 1)
+	p := resp.Pulses[0]
+	assert.Equal(t, 5, p.Start)
+	assert.Equal(t, 8, p.End)
+	require.NotNil(t, p.DurationMS, "metrics must be present when requested")
+	require.NotNil(t, p.RMSAmplitude)
+	assert.Equal(t, 0.25, *p.DurationMS)
+	assert.InDelta(t, math.Sqrt(283), *p.RMSAmplitude, 1e-12)
+
+	// The raw body carries both metric keys inside the pulse object.
+	assert.Contains(t, w.Body.String(), "duration_ms")
+	assert.Contains(t, w.Body.String(), "rms_amplitude")
+}
+
+func TestAnalyze_IncludeMetricsUndecidableStaysEmpty(t *testing.T) {
+	r := NewRouter()
+	// Zero baseline with the switch on: the undecidable envelope is
+	// unchanged and no metrics are fabricated.
+	body, err := json.Marshal(map[string]any{
+		"sample_rate":     16000.0,
+		"amplitudes":      make([]float64, 64),
+		"include_metrics": true,
+	})
+	require.NoError(t, err)
+	w := post(t, r, body)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, false, resp["decidable"])
+	assert.Equal(t, "baseline_zero", resp["reason"])
+	assert.Equal(t, []any{}, resp["pulses"])
+	assert.NotContains(t, w.Body.String(), "duration_ms")
+	assert.NotContains(t, w.Body.String(), "rms_amplitude")
+}
+
+func TestAnalyze_IncludeMetricsOffKeepsLegacyBody(t *testing.T) {
+	r := NewRouter()
+	samples := fillAPI(64, 2, map[int]float64{5: 13, 6: 25, 7: 13, 8: 13})
+	mk := func(extra map[string]any) []byte {
+		m := map[string]any{"sample_rate": 16000.0, "amplitudes": samples}
+		for k, v := range extra {
+			m[k] = v
+		}
+		b, err := json.Marshal(m)
+		require.NoError(t, err)
+		return b
+	}
+
+	omitted := post(t, r, mk(nil)).Body.String()
+	for _, extra := range []map[string]any{
+		{"include_metrics": false},
+		{"include_metrics": nil}, // explicit null means "not provided"
+	} {
+		body := post(t, r, mk(extra)).Body.String()
+		assert.Equal(t, omitted, body, "switch off must keep the legacy body: %v", extra)
+	}
+	assert.NotContains(t, omitted, "duration_ms")
+	assert.NotContains(t, omitted, "rms_amplitude")
+}
+
+func TestValidation_IncludeMetricsType(t *testing.T) {
+	r := NewRouter()
+	zeros := strings.Repeat("0,", 63) + "0"
+
+	// Only a JSON boolean is legal; every other token (including the
+	// non-finite literals) is a type error located at include_metrics.
+	for _, token := range []string{`"true"`, "1", "0", "1.5", "[]", "{}", "NaN", "Infinity"} {
+		t.Run(token, func(t *testing.T) {
+			w := postRaw(t, r, fmt.Sprintf(
+				`{"sample_rate":16000,"amplitudes":[%s],"include_metrics":%s}`, zeros, token))
+			assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+			var fe FieldError
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &fe))
+			assert.Equal(t, "validation_failed", fe.Error)
+			assert.Equal(t, "include_metrics", fe.Field)
+			assert.Equal(t, "type", fe.Constraint)
+			assert.Nil(t, fe.Index)
+			assert.NotEmpty(t, fe.Message)
+		})
+	}
+}

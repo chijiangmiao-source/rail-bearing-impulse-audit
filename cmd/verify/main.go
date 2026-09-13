@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"strings"
@@ -29,6 +30,9 @@ type pulseDTO struct {
 	Peak      float64 `json:"peak"`
 	Severity  string  `json:"severity"`
 	Baseline  float64 `json:"baseline"`
+	// Optional metrics, present only when the request switched them on.
+	DurationMS   *float64 `json:"duration_ms"`
+	RMSAmplitude *float64 `json:"rms_amplitude"`
 }
 
 type rangeDTO struct {
@@ -169,6 +173,12 @@ func main() {
 	run("null excluded-range endpoint is a located type error", c.scenarioExcludedNullEndpoint)
 	run("non-contract excluded-range endpoint names are unknown fields", c.scenarioExcludedCaseSensitiveNames)
 	run("first range dropping kept samples below 64 is the located offender", c.scenarioExcludedTooFewFirstOffender)
+
+	// --- optional per-pulse metrics (include_metrics) ---
+	run("metrics: normal pulse carries exact duration and rms", c.scenarioMetricsPrecise)
+	run("metrics: huge finite amplitudes stay finite", c.scenarioMetricsHugeFinite)
+	run("metrics: non-boolean switch is located at include_metrics", c.scenarioMetricsSwitchType)
+	run("metrics: switch off and dual-channel keep the legacy contract", c.scenarioMetricsCompatibility)
 
 	// --- dual-channel correlation ---
 	run("correlation: two coincident pulses pair with zero difference", c.scenarioCorrelatePrecise)
@@ -902,6 +912,106 @@ func (c *client) postRangesError(a *assert.Assertions, n int, rangesJSON string)
 	return decodeError(a, body)
 }
 
+// --- include_metrics scenarios -------------------------------------------------
+
+func (c *client) scenarioMetricsPrecise(a *assert.Assertions) {
+	// 4-sample pulse [5,8] with values 13, 25, 13, 13 at 16 kHz:
+	// duration = 4/16000 s = 0.25 ms; RMS covers exactly the closed
+	// interval: sqrt((13² + 25² + 13² + 13²)/4) = sqrt(283).
+	set := map[int]float64{}
+	setRange(set, 5, 8, 13)
+	set[6] = 25
+	resp, body := c.analyzeMetrics(a, 16000, flatSamples(64, 2, set))
+	a.True(resp.Decidable, "body: %s", body)
+	a.Equal(2.0, resp.Baseline)
+	if a.Len(resp.Pulses, 1) {
+		p := resp.Pulses[0]
+		a.Equal(5, p.Start)
+		a.Equal(8, p.End)
+		a.Equal(6, p.PeakIndex)
+		a.Equal(25.0, p.Peak)
+		if a.NotNil(p.DurationMS, "body: %s", body) {
+			a.Equal(0.25, *p.DurationMS)
+		}
+		if a.NotNil(p.RMSAmplitude) {
+			a.InDelta(math.Sqrt(283), *p.RMSAmplitude, 1e-12)
+		}
+	}
+}
+
+func (c *client) scenarioMetricsHugeFinite(a *assert.Assertions) {
+	// Four samples at 1e308: a naive sum of squares overflows to +Inf; the
+	// scaled sum-of-squares must return exactly 1e308, a finite value.
+	set := map[int]float64{}
+	setRange(set, 5, 8, 1e308)
+	resp, body := c.analyzeMetrics(a, 16000, flatSamples(64, 2, set))
+	a.True(resp.Decidable, "body: %s", body)
+	if a.Len(resp.Pulses, 1) {
+		p := resp.Pulses[0]
+		a.Equal(1e308, p.Peak)
+		a.Equal("severe", p.Severity)
+		if a.NotNil(p.RMSAmplitude, "body: %s", body) {
+			a.False(math.IsInf(*p.RMSAmplitude, 0), "rms must stay finite")
+			a.False(math.IsNaN(*p.RMSAmplitude), "rms must not be NaN")
+			a.Equal(1e308, *p.RMSAmplitude)
+		}
+		if a.NotNil(p.DurationMS) {
+			a.Equal(0.25, *p.DurationMS)
+		}
+	}
+}
+
+func (c *client) scenarioMetricsSwitchType(a *assert.Assertions) {
+	// The switch accepts only a JSON boolean; every other token is a type
+	// error located at include_metrics with no sample index.
+	for _, token := range []string{`"true"`, "1", "0", "1.5", "[]", "{}", "NaN", "Infinity"} {
+		raw := fmt.Sprintf(`{"sample_rate":16000,"amplitudes":[%s],"include_metrics":%s}`,
+			zerosCSV(64), token)
+		code, body := c.postRaw(a, raw)
+		a.Equal(http.StatusBadRequest, code, "token %s body: %s", token, body)
+		e := decodeError(a, body)
+		a.Equal("validation_failed", e.Error, token)
+		a.Equal("include_metrics", e.Field, token)
+		a.Equal("type", e.Constraint, token)
+		a.Nil(e.Index, token)
+	}
+}
+
+func (c *client) scenarioMetricsCompatibility(a *assert.Assertions) {
+	set := map[int]float64{}
+	setRange(set, 5, 8, 13)
+	set[6] = 25
+	samplesJSON, err := json.Marshal(flatSamples(64, 2, set))
+	if !a.NoError(err) {
+		return
+	}
+
+	// Omitted, false and null switches are byte-identical to one another
+	// and carry no metric fields: existing clients see the legacy contract.
+	baseline := ""
+	for i, tail := range []string{``, `,"include_metrics":false`, `,"include_metrics":null`} {
+		code, body := c.postRaw(a, fmt.Sprintf(
+			`{"sample_rate":16000,"amplitudes":%s%s}`, samplesJSON, tail))
+		a.Equal(http.StatusOK, code, "body: %s", body)
+		a.NotContains(string(body), "duration_ms", "tail %s", tail)
+		a.NotContains(string(body), "rms_amplitude", "tail %s", tail)
+		if i == 0 {
+			baseline = string(body)
+		} else {
+			a.Equal(baseline, string(body), "tail %s must not change the response", tail)
+		}
+	}
+
+	// The dual-channel review never carries metric fields either, in
+	// neither side's embedded analysis.
+	resp, body := c.correlateOK(a, 5,
+		channel(16000, dualBurstSamples()), channel(16000, dualBurstSamples()))
+	a.True(resp.Left.Decidable, "body: %s", body)
+	a.NotEmpty(resp.Pairs)
+	a.NotContains(string(body), "duration_ms")
+	a.NotContains(string(body), "rms_amplitude")
+}
+
 // --- dual-channel correlation scenarios --------------------------------------
 
 // channelReq is one side of a correlation request, identical in shape to
@@ -1452,6 +1562,29 @@ func (c *client) analyzeRanges(a *assert.Assertions, rate float64, samples []flo
 		Amplitudes     []float64  `json:"amplitudes"`
 		ExcludedRanges []rangeDTO `json:"excluded_ranges"`
 	}{rate, samples, ranges})
+	if !a.NoError(err) {
+		return analyzeDTO{}, nil
+	}
+	code, body := c.postRaw(a, string(payload))
+	a.Equal(http.StatusOK, code, "body: %s", body)
+
+	var resp analyzeDTO
+	if !a.NoError(json.Unmarshal(body, &resp)) {
+		return analyzeDTO{}, body
+	}
+	a.Equal(rate, resp.SampleRate)
+	a.NotNil(resp.Pulses)
+	return resp, body
+}
+
+// analyzeMetrics posts a request with include_metrics switched on and
+// expects 200.
+func (c *client) analyzeMetrics(a *assert.Assertions, rate float64, samples []float64) (analyzeDTO, []byte) {
+	payload, err := json.Marshal(struct {
+		SampleRate     float64   `json:"sample_rate"`
+		Amplitudes     []float64 `json:"amplitudes"`
+		IncludeMetrics bool      `json:"include_metrics"`
+	}{rate, samples, true})
 	if !a.NoError(err) {
 		return analyzeDTO{}, nil
 	}

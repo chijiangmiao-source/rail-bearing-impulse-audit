@@ -66,6 +66,16 @@ type rawCorrelateRequest struct {
 	Right            json.RawMessage `json:"right"`
 }
 
+// rawChannelRequest is one dual-channel side. It shares the single-channel
+// fields but deliberately not include_metrics: the correlate contract has
+// no metrics switch and its responses never carry metric fields, so the
+// key stays unknown here and is rejected as such.
+type rawChannelRequest struct {
+	SampleRate     *json.RawMessage `json:"sample_rate"`
+	Amplitudes     *json.RawMessage `json:"amplitudes"`
+	ExcludedRanges *json.RawMessage `json:"excluded_ranges"`
+}
+
 func correlateHandler(c *gin.Context) {
 	req, ferr := decodeCorrelateRequest(c.Request)
 	if ferr != nil {
@@ -190,7 +200,7 @@ func decodeCorrelateChannel(side string, token json.RawMessage) (*CorrelateChann
 		return nil, sideObjectTypeError(side)
 	}
 
-	var raw rawAnalyzeRequest
+	var raw rawChannelRequest
 	dec := json.NewDecoder(bytes.NewReader(token))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&raw); err != nil {
