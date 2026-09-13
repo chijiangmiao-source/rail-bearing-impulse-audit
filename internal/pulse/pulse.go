@@ -101,8 +101,8 @@ func (e *ValidationError) Error() string { return e.Message }
 // (adjacency is allowed), and at least MinSamples samples must remain.
 //
 // An empty list is always valid. Structural violations report the first
-// offending element; a remaining-count shortfall is attributed to the last
-// element (the one that pushes the count below the minimum).
+// offending element; a remaining-count shortfall is attributed to the first
+// element whose exclusion pushes the kept count below the minimum.
 func ValidateRanges(ranges []Range, n int) *ValidationError {
 	for i, r := range ranges {
 		if r.Start < 0 || r.Start >= n || r.End < 0 || r.End >= n {
@@ -140,19 +140,17 @@ func ValidateRanges(ranges []Range, n int) *ValidationError {
 	}
 
 	remaining := n
-	for _, r := range ranges {
+	for i, r := range ranges {
 		remaining -= r.End - r.Start + 1
-	}
-	if remaining < MinSamples {
-		// Attribute the shortfall to the element that makes the count fall
-		// below the minimum; for an empty list the loop never reaches here
-		// when n itself satisfies the input contract.
-		i := len(ranges) - 1
-		return &ValidationError{
-			Index: i, Constraint: "min_length",
-			Message: fmt.Sprintf(
-				"at least %d samples must remain after excluding ranges, got %d",
-				MinSamples, remaining),
+		if remaining < MinSamples {
+			// Locate the first element whose exclusion makes the kept count
+			// fall below the minimum, not the last element of the list.
+			return &ValidationError{
+				Index: i, Constraint: "min_length",
+				Message: fmt.Sprintf(
+					"at least %d samples must remain after excluding ranges, got %d",
+					MinSamples, remaining),
+			}
 		}
 	}
 	return nil

@@ -150,6 +150,9 @@ func main() {
 	run("overlapping excluded ranges are located at the element index", c.scenarioExcludedOverlap)
 	run("fewer than 64 kept samples is located at excluded_ranges", c.scenarioExcludedTooFew)
 	run("non-object excluded range element is located at the index", c.scenarioExcludedElementType)
+	run("null excluded-range endpoint is a located type error", c.scenarioExcludedNullEndpoint)
+	run("non-contract excluded-range endpoint names are unknown fields", c.scenarioExcludedCaseSensitiveNames)
+	run("first range dropping kept samples below 64 is the located offender", c.scenarioExcludedTooFewFirstOffender)
 
 	fmt.Printf("\n%d/%d scenarios passed\n", total-failed, total)
 	if failed > 0 {
@@ -794,6 +797,61 @@ func (c *client) scenarioExcludedElementType(a *assert.Assertions) {
 	a.Equal("excluded_ranges", e.Field)
 	a.Nil(e.Index)
 	a.Equal("type", e.Constraint)
+}
+
+func (c *client) scenarioExcludedNullEndpoint(a *assert.Assertions) {
+	// An explicit null endpoint is present but not an integer: a type error
+	// located at the element, never a missing-field (required) error.
+	for _, tc := range []struct {
+		name   string
+		ranges string
+	}{
+		{"null start", `[{"start":null,"end":3}]`},
+		{"null end", `[{"start":1,"end":null}]`},
+	} {
+		e := c.postRangesError(a, 64, tc.ranges)
+		if !a.Equal("excluded_ranges", e.Field, tc.name) {
+			continue
+		}
+		if a.NotNil(e.Index, tc.name) {
+			a.Equal(0, *e.Index, tc.name)
+		}
+		a.Equal("type", e.Constraint, tc.name)
+	}
+}
+
+func (c *client) scenarioExcludedCaseSensitiveNames(a *assert.Assertions) {
+	// Endpoint names are a case-sensitive contract: "Start"/"End" are unknown
+	// fields of the element and must never be silently accepted.
+	for _, tc := range []struct {
+		name   string
+		ranges string
+		key    string
+	}{
+		{"uppercase names", `[{"Start":1,"End":2}]`, "Start"},
+		{"mixed case", `[{"start":1,"End":2}]`, "End"},
+	} {
+		e := c.postRangesError(a, 64, tc.ranges)
+		if !a.Equal("excluded_ranges", e.Field, tc.name) {
+			continue
+		}
+		if a.NotNil(e.Index, tc.name) {
+			a.Equal(0, *e.Index, tc.name)
+		}
+		a.Equal("unknown", e.Constraint, tc.name)
+		a.Contains(e.Message, `"`+tc.key+`"`, tc.name)
+	}
+}
+
+func (c *client) scenarioExcludedTooFewFirstOffender(a *assert.Assertions) {
+	// 64 samples: the point exclusion [0,0] already leaves 63 kept samples,
+	// so it — not the later big exclusion — is the located offender.
+	e := c.postRangesError(a, 64, `[{"start":0,"end":0},{"start":32,"end":63}]`)
+	a.Equal("excluded_ranges", e.Field)
+	if a.NotNil(e.Index) {
+		a.Equal(0, *e.Index)
+	}
+	a.Equal("min_length", e.Constraint)
 }
 
 func (c *client) postRangesError(a *assert.Assertions, n int, rangesJSON string) errorDTO {

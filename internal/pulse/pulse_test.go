@@ -190,7 +190,12 @@ func TestValidateRanges(t *testing.T) {
 		{"overlap previous end", []Range{{10, 20}, {20, 21}}, 64, 1, "overlap"},
 		{"second offender located", []Range{{0, 0}, {64, 65}}, 64, 1, "range"},
 		{"excluding all but 63 samples", []Range{{63, 63}}, 64, 0, "min_length"},
-		{"one big exclusion leaves too few", []Range{{0, 0}, {32, 63}}, 64, 1, "min_length"},
+		// The first range already leaves only 63: it is the offender, not
+		// the later big exclusion.
+		{"first exclusion already leaves too few", []Range{{0, 0}, {32, 63}}, 64, 0, "min_length"},
+		// n=65: the point exclusion leaves exactly 64 (valid), so the big
+		// second exclusion is the element that tips the count below 64.
+		{"later exclusion tips below the minimum", []Range{{0, 0}, {32, 63}}, 65, 1, "min_length"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			verr := ValidateRanges(tc.ranges, tc.n)

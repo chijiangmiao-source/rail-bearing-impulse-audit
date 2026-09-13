@@ -6,7 +6,7 @@
 
 - 语言/框架：Go 1.25、Gin、testify
 - 部署：Docker + Docker Compose（多阶段构建，distroless 运行镜像）
-- 验收：内置名为 `verify` 的一次性验收服务，40 个契约场景
+- 验收：内置名为 `verify` 的一次性验收服务，43 个契约场景
 
 ---
 
@@ -148,7 +148,7 @@ go run ./cmd/verify -base-url http://127.0.0.1:8080
 # 构建并后台启动 API；宿主端口可用 API_PORT 覆盖
 API_PORT=9090 docker compose up --build -d
 
-# 一次性验收服务（等待 API 健康后运行 40 个场景，退出码 0/1）
+# 一次性验收服务（等待 API 健康后运行 43 个场景，退出码 0/1）
 docker compose run --rm verify
 
 # 或者构建后一起拉起，verify 跑完即退出
@@ -163,7 +163,7 @@ docker compose up --build
 
 ```
 cmd/api/main.go          HTTP 服务入口（含 -healthcheck 探针）
-cmd/verify/main.go       一次性验收服务（testify 断言，40 个场景）
+cmd/verify/main.go       一次性验收服务（testify 断言，43 个场景）
 internal/pulse/          检测算法：接缝屏蔽/基线/候选/合并/过滤/峰值/等级
 internal/api/            Gin 路由、JSON 解码与字段/下标级校验
 Dockerfile               golang:1.25 多阶段构建 → distroless 静态镜像

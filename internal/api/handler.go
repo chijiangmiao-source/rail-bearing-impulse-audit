@@ -247,13 +247,6 @@ func amplitudeTypeError(i int) *FieldError {
 	}
 }
 
-// rawRange keeps endpoints nullable so a missing/null endpoint is
-// distinguishable from a valid zero.
-type rawRange struct {
-	Start *float64 `json:"start"`
-	End   *float64 `json:"end"`
-}
-
 // parseExcludedRanges parses and validates excluded_ranges against an
 // amplitudes slice of length n. Every error is located at the offending
 // element index; structural errors (a non-array value) are field-level.
@@ -270,46 +263,11 @@ func parseExcludedRanges(token json.RawMessage, n int) ([]pulse.Range, *FieldErr
 
 	ranges := make([]pulse.Range, len(rawItems))
 	for i, item := range rawItems {
-		if isNull(item) {
-			return nil, excludedTypeError(i, "excluded_ranges[%d] must be an object, got null", i)
+		r, ferr := parseRangeElement(item, i)
+		if ferr != nil {
+			return nil, ferr
 		}
-		var rr rawRange
-		dec := json.NewDecoder(bytes.NewReader(item))
-		dec.DisallowUnknownFields()
-		if err := dec.Decode(&rr); err != nil {
-			var ute *json.UnmarshalTypeError
-			if errors.As(err, &ute) && ute.Field != "" {
-				return nil, excludedTypeError(i,
-					"excluded_ranges[%d].%s must be an integer JSON number", i, ute.Field)
-			}
-			msg := err.Error()
-			if strings.HasPrefix(msg, "json: unknown field ") {
-				name := strings.Trim(strings.TrimPrefix(msg, "json: unknown field "), `"`)
-				return nil, &FieldError{
-					Error: "validation_failed", Field: "excluded_ranges",
-					Index: intPtr(i), Constraint: "unknown",
-					Message: fmt.Sprintf("excluded_ranges[%d] has unknown field %q", i, name),
-				}
-			}
-			return nil, excludedTypeError(i,
-				"excluded_ranges[%d] must be a {start, end} object", i)
-		}
-		// Reject trailing non-whitespace tokens inside the element.
-		if tok := dec.Decode(&struct{}{}); !errors.Is(tok, io.EOF) {
-			return nil, excludedTypeError(i,
-				"excluded_ranges[%d] must be a single {start, end} object", i)
-		}
-		if rr.Start == nil {
-			return nil, excludedRequiredError(i, "start")
-		}
-		if rr.End == nil {
-			return nil, excludedRequiredError(i, "end")
-		}
-		if !isJSONInteger(*rr.Start) || !isJSONInteger(*rr.End) {
-			return nil, excludedTypeError(i,
-				"excluded_ranges[%d] start and end must be integer sample indices", i)
-		}
-		ranges[i] = pulse.Range{Start: int(*rr.Start), End: int(*rr.End)}
+		ranges[i] = r
 	}
 
 	if verr := pulse.ValidateRanges(ranges, n); verr != nil {
@@ -320,6 +278,96 @@ func parseExcludedRanges(token json.RawMessage, n int) ([]pulse.Range, *FieldErr
 		}
 	}
 	return ranges, nil
+}
+
+// parseRangeElement decodes one excluded_ranges element into a Range. Keys
+// are read in document order and matched case-sensitively: a non-contract
+// name (such as "Start") is an unknown field of the element, an absent
+// endpoint is a required error, and an explicit null endpoint is a type
+// error — null is not an integer.
+func parseRangeElement(item json.RawMessage, i int) (pulse.Range, *FieldError) {
+	if isNull(item) {
+		return pulse.Range{}, excludedTypeError(i, "excluded_ranges[%d] must be an object, got null", i)
+	}
+
+	notObject := func() *FieldError {
+		return excludedTypeError(i, "excluded_ranges[%d] must be a {start, end} object", i)
+	}
+
+	dec := json.NewDecoder(bytes.NewReader(item))
+	tok, err := dec.Token()
+	if err != nil {
+		return pulse.Range{}, notObject()
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return pulse.Range{}, notObject()
+	}
+
+	var start, end json.RawMessage
+	haveStart, haveEnd := false, false
+	for dec.More() {
+		kt, err := dec.Token()
+		if err != nil {
+			return pulse.Range{}, notObject()
+		}
+		key, _ := kt.(string)
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			return pulse.Range{}, notObject()
+		}
+		switch key {
+		case "start":
+			start, haveStart = raw, true
+		case "end":
+			end, haveEnd = raw, true
+		default:
+			return pulse.Range{}, &FieldError{
+				Error: "validation_failed", Field: "excluded_ranges",
+				Index: intPtr(i), Constraint: "unknown",
+				Message: fmt.Sprintf("excluded_ranges[%d] has unknown field %q", i, key),
+			}
+		}
+	}
+	if _, err := dec.Token(); err != nil { // consume the closing '}'
+		return pulse.Range{}, notObject()
+	}
+
+	if !haveStart {
+		return pulse.Range{}, excludedRequiredError(i, "start")
+	}
+	if !haveEnd {
+		return pulse.Range{}, excludedRequiredError(i, "end")
+	}
+
+	s, ferr := parseRangeEndpoint(i, "start", start)
+	if ferr != nil {
+		return pulse.Range{}, ferr
+	}
+	e, ferr := parseRangeEndpoint(i, "end", end)
+	if ferr != nil {
+		return pulse.Range{}, ferr
+	}
+	return pulse.Range{Start: s, End: e}, nil
+}
+
+// parseRangeEndpoint converts one raw endpoint value to an int. An explicit
+// null, a non-number and a non-integer number are all type errors located at
+// the element: an endpoint must be an integer JSON number.
+func parseRangeEndpoint(i int, name string, raw json.RawMessage) (int, *FieldError) {
+	if isNull(raw) {
+		return 0, excludedTypeError(i,
+			"excluded_ranges[%d]."+name+" must be an integer JSON number", i)
+	}
+	var v float64
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return 0, excludedTypeError(i,
+			"excluded_ranges[%d]."+name+" must be an integer JSON number", i)
+	}
+	if !isJSONInteger(v) {
+		return 0, excludedTypeError(i,
+			"excluded_ranges[%d] start and end must be integer sample indices", i)
+	}
+	return int(v), nil
 }
 
 func excludedTypeError(i int, format string, args ...any) *FieldError {
