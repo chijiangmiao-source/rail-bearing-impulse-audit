@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -120,6 +121,14 @@ func decodeAnalyzeRequest(r *http.Request) (*AnalyzeRequest, *FieldError) {
 	// first so the error points at the field or the sample index.
 	if ferr := locateNonFinite(body, nonFiniteAnalyze); ferr != nil {
 		return nil, ferr
+	}
+
+	// Field names are a case-sensitive contract: encoding/json matches
+	// struct tags case-insensitively, so without this walk a spelling like
+	// "Sample_rate" would be silently accepted as sample_rate.
+	if key, found := firstNonContractKey(body,
+		"sample_rate", "amplitudes", "excluded_ranges", "include_metrics"); found {
+		return nil, unknownFieldError(key, key)
 	}
 
 	var raw rawAnalyzeRequest
@@ -437,15 +446,53 @@ func isJSONInteger(v float64) bool {
 	return !math.IsNaN(v) && !math.IsInf(v, 0) && math.Trunc(v) == v
 }
 
+// firstNonContractKey walks the top-level object of body in document order
+// and returns the first key that is not exactly one of the allowed contract
+// names. encoding/json matches struct tags case-insensitively, so without
+// this walk a case variant such as "Sample_rate" would be silently accepted
+// even with DisallowUnknownFields. A non-object or malformed body yields no
+// key: the struct decode that follows reports it instead.
+func firstNonContractKey(body []byte, allowed ...string) (string, bool) {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	tok, err := dec.Token()
+	if err != nil {
+		return "", false
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return "", false
+	}
+	for dec.More() {
+		kt, err := dec.Token()
+		if err != nil {
+			return "", false
+		}
+		key, _ := kt.(string)
+		if !slices.Contains(allowed, key) {
+			return key, true
+		}
+		var skip json.RawMessage
+		if err := dec.Decode(&skip); err != nil {
+			return "", false
+		}
+	}
+	return "", false
+}
+
+// unknownFieldError is the contract rejection of a non-contract field name;
+// field is the located (possibly side-prefixed) name, name the bare key.
+func unknownFieldError(field, name string) *FieldError {
+	return &FieldError{
+		Error: "validation_failed", Field: field,
+		Constraint: "unknown", Message: fmt.Sprintf("unknown field %q", name),
+	}
+}
+
 // decodeError translates a JSON decode error into a located FieldError.
 func decodeError(err error) *FieldError {
 	msg := err.Error()
 	if strings.HasPrefix(msg, "json: unknown field ") {
 		name := strings.Trim(strings.TrimPrefix(msg, "json: unknown field "), `"`)
-		return &FieldError{
-			Error: "validation_failed", Field: name,
-			Constraint: "unknown", Message: fmt.Sprintf("unknown field %q", name),
-		}
+		return unknownFieldError(name, name)
 	}
 	var ute *json.UnmarshalTypeError
 	if errors.As(err, &ute) {

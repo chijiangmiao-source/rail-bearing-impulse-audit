@@ -157,6 +157,8 @@ func main() {
 	run("NaN token is located at sample index", c.scenarioElementNaN)
 	run("Infinity token is located at sample index", c.scenarioElementInfinity)
 	run("unknown field is rejected and named", c.scenarioUnknownField)
+	run("case-variant field names are rejected as unknown", c.scenarioCaseVariantFields)
+	run("case-variant metrics switch is rejected without analyzing", c.scenarioMetricsCaseVariant)
 	run("malformed JSON is rejected", c.scenarioMalformed)
 	run("seam shielding recomputes baseline and severity from kept samples", c.scenarioExcludedSeam)
 	run("end-to-end: seam shielding, candidate break and range echo in one sample", c.scenarioExcludedCombined)
@@ -203,6 +205,8 @@ func main() {
 	run("correlation: differing sample rates are located at right.sample_rate", c.scenarioCorrelateRateMismatch)
 	run("correlation: invalid request returns no partial association", c.scenarioCorrelateNoPartialOnError)
 	run("correlation: unknown top-level field is rejected and named", c.scenarioCorrelateUnknownField)
+	run("correlation: case-variant top-level names are rejected", c.scenarioCorrelateCaseVariantFields)
+	run("correlation: case-variant side fields are located by side", c.scenarioCorrelateSideCaseVariantFields)
 
 	fmt.Printf("\n%d/%d scenarios passed\n", total-failed, total)
 	if failed > 0 {
@@ -577,6 +581,43 @@ func (c *client) scenarioUnknownField(a *assert.Assertions) {
 	a.Equal(http.StatusBadRequest, code)
 	e := decodeError(a, body)
 	a.Equal("extra", e.Field)
+}
+
+func (c *client) scenarioCaseVariantFields(a *assert.Assertions) {
+	// Field names are a case-sensitive contract: a capitalized sample rate
+	// or amplitude key is an unknown field and must never be analyzed.
+	for _, tc := range []struct {
+		name  string
+		raw   string
+		field string
+	}{
+		{"capitalized sample_rate", fmt.Sprintf(
+			`{"Sample_rate":16000,"amplitudes":[%s]}`, zerosCSV(64)), "Sample_rate"},
+		{"capitalized amplitudes", fmt.Sprintf(
+			`{"sample_rate":16000,"Amplitudes":[%s]}`, zerosCSV(64)), "Amplitudes"},
+	} {
+		code, body := c.postRaw(a, tc.raw)
+		a.Equal(http.StatusBadRequest, code, "%s body: %s", tc.name, body)
+		e := decodeError(a, body)
+		a.Equal("validation_failed", e.Error, tc.name)
+		a.Equal(tc.field, e.Field, tc.name)
+		a.Equal("unknown", e.Constraint, tc.name)
+		a.NotContains(string(body), "pulses", tc.name)
+	}
+}
+
+func (c *client) scenarioMetricsCaseVariant(a *assert.Assertions) {
+	// A case variant of the metrics switch is an unknown field: the request
+	// is rejected and no duration/rms analysis is produced.
+	code, body := c.postRaw(a, fmt.Sprintf(
+		`{"sample_rate":16000,"amplitudes":[%s],"Include_Metrics":true}`, zerosCSV(64)))
+	a.Equal(http.StatusBadRequest, code, "body: %s", body)
+	e := decodeError(a, body)
+	a.Equal("validation_failed", e.Error)
+	a.Equal("Include_Metrics", e.Field)
+	a.Equal("unknown", e.Constraint)
+	a.NotContains(string(body), "duration_ms")
+	a.NotContains(string(body), "rms_amplitude")
 }
 
 func (c *client) scenarioMalformed(a *assert.Assertions) {
@@ -1452,6 +1493,59 @@ func (c *client) scenarioCorrelateUnknownField(a *assert.Assertions) {
 	e := decodeError(a, body)
 	a.Equal("extra", e.Field)
 	a.Equal("unknown", e.Constraint)
+}
+
+func (c *client) scenarioCorrelateCaseVariantFields(a *assert.Assertions) {
+	// Tolerance and side names are case-sensitive contract names: a variant
+	// is an unknown field and must never produce an association.
+	for _, tc := range []struct {
+		name  string
+		raw   string
+		field string
+	}{
+		{"capitalized tolerance", fmt.Sprintf(
+			`{"Tolerance_Samples":1,"left":%s,"right":%s}`, zerosSide(64), zerosSide(64)),
+			"Tolerance_Samples"},
+		{"capitalized left", fmt.Sprintf(
+			`{"tolerance_samples":1,"Left":%s,"right":%s}`, zerosSide(64), zerosSide(64)),
+			"Left"},
+		{"capitalized right", fmt.Sprintf(
+			`{"tolerance_samples":1,"left":%s,"Right":%s}`, zerosSide(64), zerosSide(64)),
+			"Right"},
+	} {
+		code, body := c.postCorrelateRaw(a, tc.raw)
+		a.Equal(http.StatusBadRequest, code, "%s body: %s", tc.name, body)
+		e := decodeError(a, body)
+		a.Equal("validation_failed", e.Error, tc.name)
+		a.Equal(tc.field, e.Field, tc.name)
+		a.Equal("unknown", e.Constraint, tc.name)
+		a.NotContains(string(body), "pairs", tc.name)
+	}
+}
+
+func (c *client) scenarioCorrelateSideCaseVariantFields(a *assert.Assertions) {
+	// Inside a side object a case-variant sampling parameter is an unknown
+	// field located with the side prefix.
+	for _, tc := range []struct {
+		name  string
+		raw   string
+		field string
+	}{
+		{"left sample rate variant", fmt.Sprintf(
+			`{"tolerance_samples":1,"left":{"Sample_rate":16000,"amplitudes":[%s]},"right":%s}`,
+			zerosCSV(64), zerosSide(64)), "left.Sample_rate"},
+		{"right amplitudes variant", fmt.Sprintf(
+			`{"tolerance_samples":1,"left":%s,"right":{"sample_rate":16000,"Amplitudes":[%s]}}`,
+			zerosSide(64), zerosCSV(64)), "right.Amplitudes"},
+	} {
+		code, body := c.postCorrelateRaw(a, tc.raw)
+		a.Equal(http.StatusBadRequest, code, "%s body: %s", tc.name, body)
+		e := decodeError(a, body)
+		a.Equal("validation_failed", e.Error, tc.name)
+		a.Equal(tc.field, e.Field, tc.name)
+		a.Equal("unknown", e.Constraint, tc.name)
+		a.NotContains(string(body), "pairs", tc.name)
+	}
 }
 
 func zerosSide(n int) string {

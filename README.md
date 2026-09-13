@@ -6,7 +6,7 @@
 
 - 语言/框架：Go 1.25、Gin、testify
 - 部署：Docker + Docker Compose（多阶段构建，distroless 运行镜像）
-- 验收：内置名为 `verify` 的一次性验收服务，69 个契约场景
+- 验收：内置名为 `verify` 的一次性验收服务，73 个契约场景
 
 ---
 
@@ -90,6 +90,10 @@ order | overlap | unknown`：
 - `overlap`：与前一区间重叠；
 - `min_length`：排除后有效样本少于 64；
 - `type`/`required`/`unknown`：元素不是对象、端点不是整数、缺少端点或出现未知字段。
+
+字段名**大小写敏感**：`Sample_rate`、`Include_Metrics`、`Tolerance_Samples` 等
+大小写变体一律按 `unknown` 拒绝（双通道一侧内的变体以 `left.`/`right.` 前缀定位），
+不会折叠到契约字段上执行分析或关联。
 
 `NaN`/`Infinity`/`-Infinity` 不是合法 JSON 数值，服务同样定位到具体字段或样本下标。
 
@@ -258,7 +262,7 @@ go run ./cmd/verify -base-url http://127.0.0.1:8080
 # 构建并后台启动 API；宿主端口可用 API_PORT 覆盖
 API_PORT=9090 docker compose up --build -d
 
-# 一次性验收服务（等待 API 健康后运行 69 个场景，退出码 0/1）
+# 一次性验收服务（等待 API 健康后运行 73 个场景，退出码 0/1）
 docker compose run --rm verify
 
 # 或者构建后一起拉起，verify 跑完即退出

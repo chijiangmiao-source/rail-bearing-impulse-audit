@@ -287,6 +287,48 @@ func TestValidation_UnknownFieldNamed(t *testing.T) {
 	assert.Equal(t, "bogus", fe.Field)
 }
 
+func TestValidation_FieldNamesAreCaseSensitive(t *testing.T) {
+	r := NewRouter()
+	zeros := strings.Repeat("0,", 63) + "0"
+
+	// Contract names are case-sensitive: encoding/json would otherwise fold
+	// a variant like "Sample_rate" onto the real field and the request would
+	// be silently analyzed instead of rejected.
+	for _, tc := range []struct {
+		name  string
+		raw   string
+		field string
+	}{
+		{"capitalized sample_rate",
+			`{"Sample_rate":16000,"amplitudes":[` + zeros + `]}`, "Sample_rate"},
+		{"capitalized amplitudes",
+			`{"sample_rate":16000,"Amplitudes":[` + zeros + `]}`, "Amplitudes"},
+		{"uppercase amplitudes",
+			`{"sample_rate":16000,"AMPLITUDES":[` + zeros + `]}`, "AMPLITUDES"},
+		{"capitalized excluded_ranges",
+			`{"sample_rate":16000,"amplitudes":[` + zeros + `],"Excluded_Ranges":[]}`, "Excluded_Ranges"},
+		{"capitalized include_metrics",
+			`{"sample_rate":16000,"amplitudes":[` + zeros + `],"Include_Metrics":true}`, "Include_Metrics"},
+		{"uppercase include_metrics",
+			`{"sample_rate":16000,"amplitudes":[` + zeros + `],"INCLUDE_METRICS":true}`, "INCLUDE_METRICS"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := postRaw(t, r, tc.raw)
+			assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+			var fe FieldError
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &fe))
+			assert.Equal(t, "validation_failed", fe.Error)
+			assert.Equal(t, tc.field, fe.Field)
+			assert.Equal(t, "unknown", fe.Constraint)
+			assert.Nil(t, fe.Index)
+			assert.Contains(t, fe.Message, `"`+tc.field+`"`)
+			// The request is rejected outright: no analysis leaks through.
+			assert.NotContains(t, w.Body.String(), "pulses")
+			assert.NotContains(t, w.Body.String(), "duration_ms")
+		})
+	}
+}
+
 func TestValidation_MalformedJSON(t *testing.T) {
 	r := NewRouter()
 	w := postRaw(t, r, `{"sample_rate":`)

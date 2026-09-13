@@ -650,3 +650,75 @@ func TestValidation_CorrelateRejectsPartialAndUnknownTopFields(t *testing.T) {
 	assert.Equal(t, "extra", fe.Field)
 	assert.Equal(t, "unknown", fe.Constraint)
 }
+
+func TestValidation_CorrelateFieldNamesAreCaseSensitive(t *testing.T) {
+	r := NewRouter()
+	zeros := strings.Repeat("0,", 63) + "0"
+	side := fmt.Sprintf(`{"sample_rate":16000,"amplitudes":[%s]}`, zeros)
+
+	// Top-level contract names are case-sensitive: a variant must be
+	// rejected as an unknown field, never folded onto the real name and
+	// associated.
+	for _, tc := range []struct {
+		name  string
+		raw   string
+		field string
+	}{
+		{"capitalized tolerance", fmt.Sprintf(
+			`{"Tolerance_Samples":1,"left":%s,"right":%s}`, side, side), "Tolerance_Samples"},
+		{"capitalized left", fmt.Sprintf(
+			`{"tolerance_samples":1,"Left":%s,"right":%s}`, side, side), "Left"},
+		{"capitalized right", fmt.Sprintf(
+			`{"tolerance_samples":1,"left":%s,"Right":%s}`, side, side), "Right"},
+		{"uppercase right", fmt.Sprintf(
+			`{"tolerance_samples":1,"left":%s,"RIGHT":%s}`, side, side), "RIGHT"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := postCorrelateRaw(t, r, tc.raw)
+			assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+			var fe FieldError
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &fe))
+			assert.Equal(t, "validation_failed", fe.Error)
+			assert.Equal(t, tc.field, fe.Field)
+			assert.Equal(t, "unknown", fe.Constraint)
+			assert.Nil(t, fe.Index)
+			assert.NotContains(t, w.Body.String(), "pairs")
+		})
+	}
+}
+
+func TestValidation_CorrelateChannelFieldNamesAreCaseSensitive(t *testing.T) {
+	r := NewRouter()
+	zeros := strings.Repeat("0,", 63) + "0"
+	good := fmt.Sprintf(`{"sample_rate":16000,"amplitudes":[%s]}`, zeros)
+
+	// Inside a side object the same case-sensitive contract applies, and the
+	// unknown field is located with the side prefix.
+	for _, tc := range []struct {
+		name  string
+		raw   string
+		field string
+	}{
+		{"left sample rate variant", fmt.Sprintf(
+			`{"tolerance_samples":1,"left":{"Sample_rate":16000,"amplitudes":[%s]},"right":%s}`,
+			zeros, good), "left.Sample_rate"},
+		{"right amplitudes variant", fmt.Sprintf(
+			`{"tolerance_samples":1,"left":%s,"right":{"sample_rate":16000,"Amplitudes":[%s]}}`,
+			good, zeros), "right.Amplitudes"},
+		{"left excluded_ranges variant", fmt.Sprintf(
+			`{"tolerance_samples":1,"left":{"sample_rate":16000,"amplitudes":[%s],"Excluded_Ranges":[]},"right":%s}`,
+			zeros, good), "left.Excluded_Ranges"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := postCorrelateRaw(t, r, tc.raw)
+			assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+			var fe FieldError
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &fe))
+			assert.Equal(t, "validation_failed", fe.Error)
+			assert.Equal(t, tc.field, fe.Field)
+			assert.Equal(t, "unknown", fe.Constraint)
+			assert.Nil(t, fe.Index)
+			assert.NotContains(t, w.Body.String(), "pairs")
+		})
+	}
+}

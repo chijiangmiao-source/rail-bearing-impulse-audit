@@ -138,6 +138,13 @@ func decodeCorrelateRequest(r *http.Request) (*CorrelateRequest, *FieldError) {
 		return nil, ferr
 	}
 
+	// The top-level names are a case-sensitive contract too: a variant like
+	// "Tolerance_Samples" or "Left" is an unknown field, never folded onto
+	// the contract name by encoding/json's case-insensitive matching.
+	if key, found := firstNonContractKey(body, "tolerance_samples", "left", "right"); found {
+		return nil, unknownFieldError(key, key)
+	}
+
 	var raw rawCorrelateRequest
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
@@ -198,6 +205,13 @@ func decodeCorrelateChannel(side string, token json.RawMessage) (*CorrelateChann
 	}
 	if isNull(token) {
 		return nil, sideObjectTypeError(side)
+	}
+
+	// Side field names follow the same case-sensitive contract; a variant
+	// like "Sample_rate" is an unknown field located with the side prefix.
+	if key, found := firstNonContractKey(token,
+		"sample_rate", "amplitudes", "excluded_ranges"); found {
+		return nil, unknownFieldError(side+"."+key, key)
 	}
 
 	var raw rawChannelRequest
@@ -308,10 +322,7 @@ func channelDecodeError(side string, err error) *FieldError {
 	const unknownPrefix = "json: unknown field "
 	if strings.HasPrefix(msg, unknownPrefix) {
 		name := strings.Trim(strings.TrimPrefix(msg, unknownPrefix), `"`)
-		return &FieldError{
-			Error: "validation_failed", Field: side + "." + name,
-			Constraint: "unknown", Message: fmt.Sprintf("unknown field %q", name),
-		}
+		return unknownFieldError(side+"."+name, name)
 	}
 	return sideObjectTypeError(side)
 }
