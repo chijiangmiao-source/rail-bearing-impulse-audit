@@ -67,6 +67,7 @@ func NewRouter() *gin.Engine {
 	v1 := r.Group("/api/v1")
 	{
 		v1.POST("/pulses/analyze", analyzeHandler)
+		v1.POST("/pulses/correlate", correlateHandler)
 	}
 	return r
 }
@@ -103,7 +104,7 @@ func decodeAnalyzeRequest(r *http.Request) (*AnalyzeRequest, *FieldError) {
 	// NaN/Infinity are not JSON numbers, so the standard decoder rejects the
 	// whole document without saying which value offended. Locate such tokens
 	// first so the error points at the field or the sample index.
-	if ferr := locateNonFinite(body); ferr != nil {
+	if ferr := locateNonFinite(body, nonFiniteAnalyze); ferr != nil {
 		return nil, ferr
 	}
 
@@ -428,10 +429,15 @@ type frame struct {
 	idx int
 }
 
+// nonFiniteLocator maps a NaN/Infinity token found by the JSON walk to a
+// located field error. It receives the container stack and the pending
+// object key the token is the value of.
+type nonFiniteLocator func(stack []frame, pendingKey string) *FieldError
+
 // locateNonFinite finds the first NaN/Infinity/-Infinity literal outside of a
-// JSON string and returns an error located at the field or sample index.
-// Valid JSON has no such literals, so a nil result means nothing to report.
-func locateNonFinite(body []byte) *FieldError {
+// JSON string and asks locate to report it. Valid JSON has no such literals,
+// so a nil result means nothing to report.
+func locateNonFinite(body []byte, locate nonFiniteLocator) *FieldError {
 	var stack []frame
 	pendingKey := ""
 
@@ -473,11 +479,11 @@ func locateNonFinite(body []byte) *FieldError {
 		case c == ':':
 			i++
 		case c == 'N' && i+3 <= n && string(body[i:i+3]) == "NaN":
-			return nonFiniteError(stack, pendingKey)
+			return locate(stack, pendingKey)
 		case c == 'I' && i+8 <= n && string(body[i:i+8]) == "Infinity":
-			return nonFiniteError(stack, pendingKey)
+			return locate(stack, pendingKey)
 		case c == '-' && i+9 <= n && string(body[i:i+9]) == "-Infinity":
-			return nonFiniteError(stack, pendingKey)
+			return locate(stack, pendingKey)
 		default:
 			// Skip ordinary numbers/keywords/unknown chars; structural
 			// validity is checked by encoding/json afterwards.
@@ -487,8 +493,9 @@ func locateNonFinite(body []byte) *FieldError {
 	return nil
 }
 
-// nonFiniteError maps the current walk position to a located field error.
-func nonFiniteError(stack []frame, pendingKey string) *FieldError {
+// nonFiniteAnalyze maps a NaN/Infinity token in a single-channel analyze
+// request to its located field error.
+func nonFiniteAnalyze(stack []frame, pendingKey string) *FieldError {
 	if len(stack) > 0 {
 		top := stack[len(stack)-1]
 		if top.kind == '[' && top.key == "amplitudes" {

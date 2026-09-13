@@ -6,7 +6,7 @@
 
 - 语言/框架：Go 1.25、Gin、testify
 - 部署：Docker + Docker Compose（多阶段构建，distroless 运行镜像）
-- 验收：内置名为 `verify` 的一次性验收服务，43 个契约场景
+- 验收：内置名为 `verify` 的一次性验收服务，65 个契约场景
 
 ---
 
@@ -125,6 +125,75 @@ order | overlap | unknown`：
 
 另有 `GET /healthz` 存活探针。
 
+## 双通道关联复核（`POST /api/v1/pulses/correlate`）
+
+车辆段工程师把**同一轮对两侧轨道拾音器**的采样放在一次复核中。两侧各自携带
+现有的 `sample_rate`、`amplitudes`、`excluded_ranges`，按单通道完全相同的
+规则（含各自的采样率、振幅与接缝排除语义）独立完成脉冲分析，再建立一对一证据。
+
+请求：
+
+```json
+{
+  "tolerance_samples": 5,
+  "left":  { "sample_rate": 16000, "amplitudes": [2.0, 13.0, 25.0] },
+  "right": { "sample_rate": 16000, "amplitudes": [2.0, 13.0, 25.0] }
+}
+```
+
+- `tolerance_samples`：**必填**，闭区间 `[0, 100]` 内的整数（0 合法，表示峰值
+  下标必须完全相同）。
+- `left`/`right`：**必填**的单通道对象，字段与约束同 `POST /pulses/analyze`，
+  可各自携带 `excluded_ranges`。
+- 两侧 `sample_rate` 必须**完全相等**（采样率不一致时以 `right.sample_rate`
+  定位、`constraint: "sample_rate_mismatch"` 拒绝）。
+
+成功（`200`）：
+
+```json
+{
+  "sample_rate": 16000,
+  "tolerance_samples": 5,
+  "left":  { "sample_rate": 16000, "decidable": true, "baseline": 2, "pulses": [ ] },
+  "right": { "sample_rate": 16000, "decidable": true, "baseline": 2, "pulses": [ ] },
+  "pairs": [
+    { "left_pulse_index": 0, "right_pulse_index": 0, "time_difference_samples": 0 }
+  ],
+  "left_unpaired": [],
+  "right_unpaired": []
+}
+```
+
+- `left`/`right`：两侧**原有分析结果原样保留**（字段形状与单通道接口逐字段一致，
+  包括 `reason` 与 `excluded_ranges` 原样回显）。
+- `pairs`：已配对证据。仅当**两侧均可判定**时才产生；候选按
+  **（峰值时刻差、左侧峰值下标、右侧峰值下标）升序**依次选择，任一脉冲被占用后，
+  涉及它的后续候选一律跳过。每个脉冲至多参与一对，脉冲数量不等或多个候选同时
+  落入容差时仍得到唯一结果。证据按左侧峰值下标升序输出。
+- `time_difference_samples`：两侧峰值下标的绝对差，恒满足
+  `≤ tolerance_samples`。
+- `left_unpaired`/`right_unpaired`：各侧未配对脉冲在该侧 `pulses` 列表中的
+  下标，**固定按下标升序**；即使为空也序列化为 `[]`，绝不输出 `null`。
+- 任一侧不可判定（`decidable=false`，如 `baseline_zero`/`no_pulses`）时不产生
+  任何 `pairs`，可判定一侧的全部脉冲下标进入对应的 `unpaired` 列表。
+
+错误（`400`）沿用现有错误结构，`field` 使用 `left`/`right`/`tolerance_samples`
+前缀精确定位：
+
+| 位置 | `field` | `constraint` |
+| --- | --- | --- |
+| 容差缺失 | `tolerance_samples` | `required` |
+| 容差非整数/非数值/null（含 `NaN`/`Infinity`） | `tolerance_samples` | `type` |
+| 容差超出 `[0,100]` | `tolerance_samples` | `range` |
+| 一侧缺失或为 null/非标量对象 | `left` / `right` | `required` / `type` |
+| 一侧内部字段错误 | `left.sample_rate`、`right.amplitudes` 等 | 单通道原有约束 |
+| 一侧区间元素错误 | `left.excluded_ranges`（保留元素 `index`） | `order`/`range`/… |
+| 一侧样本为 NaN/Infinity | `left.amplitudes`（保留样本 `index`） | `finite` |
+| 两侧采样率不一致 | `right.sample_rate` | `sample_rate_mismatch` |
+
+任何非法请求只返回错误信封，**不输出任何部分关联结果**。
+
+
 ## 本地运行（无 Docker）
 
 需要 Go 1.25+。
@@ -148,7 +217,7 @@ go run ./cmd/verify -base-url http://127.0.0.1:8080
 # 构建并后台启动 API；宿主端口可用 API_PORT 覆盖
 API_PORT=9090 docker compose up --build -d
 
-# 一次性验收服务（等待 API 健康后运行 43 个场景，退出码 0/1）
+# 一次性验收服务（等待 API 健康后运行 65 个场景，退出码 0/1）
 docker compose run --rm verify
 
 # 或者构建后一起拉起，verify 跑完即退出
@@ -163,9 +232,9 @@ docker compose up --build
 
 ```
 cmd/api/main.go          HTTP 服务入口（含 -healthcheck 探针）
-cmd/verify/main.go       一次性验收服务（testify 断言，43 个场景）
-internal/pulse/          检测算法：接缝屏蔽/基线/候选/合并/过滤/峰值/等级
-internal/api/            Gin 路由、JSON 解码与字段/下标级校验
+cmd/verify/main.go       一次性验收服务（testify 断言，65 个场景）
+internal/pulse/          检测算法：单通道接缝屏蔽/基线/候选/合并/过滤/峰值/等级；双通道配对
+internal/api/            Gin 路由、JSON 解码与字段/下标级校验；双通道关联处理器与左右前缀定位
 Dockerfile               golang:1.25 多阶段构建 → distroless 静态镜像
 docker-compose.yml       api 服务 + verify 一次性验收服务
 ```
