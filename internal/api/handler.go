@@ -76,6 +76,7 @@ func NewRouter() *gin.Engine {
 	{
 		v1.POST("/pulses/analyze", analyzeHandler)
 		v1.POST("/pulses/correlate", correlateHandler)
+		v1.POST("/acquisition-audits", acquisitionAuditHandler)
 	}
 	return r
 }

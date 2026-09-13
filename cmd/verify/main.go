@@ -73,6 +73,20 @@ type errorDTO struct {
 	Message    string `json:"message"`
 }
 
+type auditFindingDTO struct {
+	Code     string `json:"code"`
+	Severity string `json:"severity"`
+	Message  string `json:"message"`
+}
+
+type auditDTO struct {
+	ClippingRatio   float64           `json:"clipping_ratio"`
+	LongestFlatline int               `json:"longest_flatline"`
+	MeanAbsRatio    float64           `json:"mean_abs_ratio"`
+	Status          string            `json:"status"`
+	Findings        []auditFindingDTO `json:"findings"`
+}
+
 // failureRecorder adapts testify's TestingT and counts failures per scenario.
 type failureRecorder struct {
 	failed bool
@@ -207,6 +221,27 @@ func main() {
 	run("correlation: unknown top-level field is rejected and named", c.scenarioCorrelateUnknownField)
 	run("correlation: case-variant top-level names are rejected", c.scenarioCorrelateCaseVariantFields)
 	run("correlation: case-variant side fields are located by side", c.scenarioCorrelateSideCaseVariantFields)
+
+	// --- independent acquisition-quality audits ---
+	run("audit: healthy quiet signal returns metrics and no findings", c.scenarioAuditHealthy)
+	run("audit: clipping equality at 0.5% degrades and at 5% rejects", c.scenarioAuditClippingBoundaries)
+	run("audit: flatline equality at 16 degrades and at 64 rejects", c.scenarioAuditFlatlineBoundaries)
+	run("audit: the longest equal-value closed interval wins", c.scenarioAuditLongestFlatline)
+	run("audit: mean level equality at 10% degrades", c.scenarioAuditMeanBoundary)
+	run("audit: rejected wins over degraded findings in fixed order", c.scenarioAuditFindingsOrder)
+	run("audit: all-legal zeros are rejected as a stalled-card flatline", c.scenarioAuditZerosRejected)
+	run("audit: missing full_scale is located at full_scale", c.scenarioAuditFullScaleMissing)
+	run("audit: zero or negative full_scale is located at full_scale", c.scenarioAuditFullScaleRange)
+	run("audit: null and wrong-typed full_scale are located at full_scale", c.scenarioAuditFullScaleType)
+	run("audit: too few samples is located at samples", c.scenarioAuditTooFew)
+	run("audit: too many samples is located at samples", c.scenarioAuditTooMany)
+	run("audit: non-array samples is located at samples", c.scenarioAuditSamplesNotArray)
+	run("audit: non-numeric sample element is located at its index", c.scenarioAuditElementType)
+	run("audit: NaN/Infinity sample is located at its index", c.scenarioAuditElementNonFinite)
+	run("audit: missing or null samples is located at samples", c.scenarioAuditSamplesMissing)
+	run("audit: invalid request returns no partial report", c.scenarioAuditNoPartialOnError)
+	run("audit: unknown and case-variant fields are rejected", c.scenarioAuditUnknownField)
+	run("audit: same request yields byte-identical responses", c.scenarioAuditDeterminism)
 
 	fmt.Printf("\n%d/%d scenarios passed\n", total-failed, total)
 	if failed > 0 {
@@ -1558,6 +1593,391 @@ func sideWithRate(rate float64, n int) string {
 
 func intPtrVerify(i int) *int { return &i }
 
+// --- acquisition audit scenarios ---------------------------------------------
+
+// alternatingAudit returns n samples alternating pos/neg by index; runs of
+// equal base values never exceed one sample.
+func alternatingAudit(n int, pos, neg float64) []float64 {
+	s := make([]float64, n)
+	for i := range s {
+		if i%2 == 0 {
+			s[i] = pos
+		} else {
+			s[i] = neg
+		}
+	}
+	return s
+}
+
+func (c *client) scenarioAuditHealthy(a *assert.Assertions) {
+	// 256 samples alternating ±1 at full scale 100: nothing clips, no run
+	// passes one sample, mean absolute level is exactly 1%.
+	resp, body := c.auditOK(a, 100, alternatingAudit(256, 1, -1))
+	a.Equal("healthy", resp.Status, "body: %s", body)
+	a.Equal(0.0, resp.ClippingRatio)
+	a.Equal(1, resp.LongestFlatline)
+	a.Equal(0.01, resp.MeanAbsRatio)
+	a.Empty(resp.Findings)
+}
+
+func (c *client) scenarioAuditClippingBoundaries(a *assert.Assertions) {
+	n := 1000
+
+	// Exactly five samples at or past full scale (one negative, one above):
+	// ratio 0.005 lands on the degraded boundary and equality must degrade.
+	degradedSet := alternatingAudit(n, 1, -1)
+	for _, i := range []int{0, 200, 400, 600, 800} {
+		degradedSet[i] = 100
+	}
+	degradedSet[400] = -100
+	degradedSet[800] = 101
+	d, body := c.auditOK(a, 100, degradedSet)
+	a.Equal(0.005, d.ClippingRatio, "body: %s", body)
+	a.Equal("degraded", d.Status)
+	if a.Len(d.Findings, 1) {
+		a.Equal("clipping", d.Findings[0].Code)
+		a.Equal("degraded", d.Findings[0].Severity)
+	}
+
+	// Exactly fifty isolated clips: ratio lands on 0.05 and equality
+	// rejects. Base level 1 keeps the mean ratio (0.0595) below 10%, so the
+	// clipping finding is the only one.
+	rejectSet := alternatingAudit(n, 1, -1)
+	for i := 0; i < n; i += 20 {
+		rejectSet[i] = 100
+	}
+	r, body := c.auditOK(a, 100, rejectSet)
+	a.Equal(0.05, r.ClippingRatio, "body: %s", body)
+	a.Equal("rejected", r.Status)
+	if a.Len(r.Findings, 1) {
+		a.Equal("clipping", r.Findings[0].Code)
+		a.Equal("rejected", r.Findings[0].Severity)
+	}
+
+	// Four clips (0.4%) are below even the degraded boundary: healthy.
+	healthy := alternatingAudit(n, 1, -1)
+	for _, i := range []int{0, 250, 500, 750} {
+		healthy[i] = 100
+	}
+	h, _ := c.auditOK(a, 100, healthy)
+	a.Equal(0.004, h.ClippingRatio)
+	a.Equal("healthy", h.Status)
+	a.Empty(h.Findings)
+}
+
+func (c *client) scenarioAuditFlatlineBoundaries(a *assert.Assertions) {
+	// Exactly 16 equal samples lands on the degraded boundary. The base at
+	// index 16 is also 1 (even index), so it is forced to -1 to end the run.
+	sixteen := alternatingAudit(256, 1, -1)
+	for i := 0; i <= 15; i++ {
+		sixteen[i] = 1
+	}
+	sixteen[16] = -1
+	d, body := c.auditOK(a, 100, sixteen)
+	a.Equal(16, d.LongestFlatline, "body: %s", body)
+	a.Equal("degraded", d.Status)
+	if a.Len(d.Findings, 1) {
+		a.Equal("flatline", d.Findings[0].Code)
+		a.Equal("degraded", d.Findings[0].Severity)
+	}
+
+	// A 64-sample run lands on the rejected boundary. A separate 20-sample
+	// run later must not replace it as the longest closed interval.
+	longest := alternatingAudit(256, 1, -1)
+	for i := 0; i <= 63; i++ {
+		longest[i] = 1
+	}
+	longest[64] = -1 // even index whose base would continue the run
+	for i := 200; i <= 219; i++ {
+		longest[i] = -5
+	}
+	r, body := c.auditOK(a, 100, longest)
+	a.Equal(64, r.LongestFlatline, "body: %s", body)
+	a.Equal("rejected", r.Status)
+	if a.Len(r.Findings, 1) {
+		a.Equal("flatline", r.Findings[0].Code)
+		a.Equal("rejected", r.Findings[0].Severity)
+	}
+}
+
+func (c *client) scenarioAuditLongestFlatline(a *assert.Assertions) {
+	// Two disjoint equal-value runs of different lengths: the report names
+	// the longest closed interval, regardless of position.
+	s := alternatingAudit(256, 1, -1)
+	for i := 10; i <= 41; i++ { // 32-sample run
+		s[i] = 7
+	}
+	for i := 100; i <= 119; i++ { // 20-sample run, shorter
+		s[i] = -9
+	}
+	resp, body := c.auditOK(a, 100, s)
+	a.Equal(32, resp.LongestFlatline, "body: %s", body)
+	a.Equal("degraded", resp.Status)
+}
+
+func (c *client) scenarioAuditMeanBoundary(a *assert.Assertions) {
+	// Alternating ±10 at full scale 100: mean ratio lands exactly on 0.10
+	// and equality degrades without any clipping or flatline.
+	atBoundary, body := c.auditOK(a, 100, alternatingAudit(256, 10, -10))
+	a.Equal(0.10, atBoundary.MeanAbsRatio, "body: %s", body)
+	a.Equal(0.0, atBoundary.ClippingRatio)
+	a.Equal(1, atBoundary.LongestFlatline)
+	a.Equal("degraded", atBoundary.Status)
+	if a.Len(atBoundary.Findings, 1) {
+		a.Equal("high_mean_level", atBoundary.Findings[0].Code)
+	}
+
+	// Just under the boundary stays healthy.
+	below, _ := c.auditOK(a, 100, alternatingAudit(256, 9.99, -9.99))
+	a.Equal("healthy", below.Status)
+	a.Empty(below.Findings)
+}
+
+func (c *client) scenarioAuditFindingsOrder(a *assert.Assertions) {
+	n := 1000
+
+	// Five isolated clips (0.5%), a 16-sample run and a base level of ±10
+	// fire every degraded rule at once; findings follow the fixed
+	// code-alphabetical order.
+	s := alternatingAudit(n, 10, -10)
+	for _, i := range []int{0, 200, 400, 600, 800} {
+		s[i] = 100
+	}
+	for i := 101; i <= 116; i++ {
+		s[i] = 50
+	}
+	d, body := c.auditOK(a, 100, s)
+	a.Equal("degraded", d.Status, "body: %s", body)
+	if a.Len(d.Findings, 3) {
+		a.Equal("clipping", d.Findings[0].Code)
+		a.Equal("flatline", d.Findings[1].Code)
+		a.Equal("high_mean_level", d.Findings[2].Code)
+		for _, f := range d.Findings {
+			a.Equal("degraded", f.Severity)
+			a.NotEmpty(f.Message)
+		}
+	}
+
+	// Raising clipping to the 5% equality boundary rejects the whole audit:
+	// the clipping finding carries rejected severity while the fixed order
+	// and the degraded siblings stay in place.
+	for i := 0; i < n; i += 20 {
+		s[i] = 100
+	}
+	r, body := c.auditOK(a, 100, s)
+	a.Equal(0.05, r.ClippingRatio, "body: %s", body)
+	a.Equal("rejected", r.Status)
+	if a.Len(r.Findings, 3) {
+		a.Equal("clipping", r.Findings[0].Code)
+		a.Equal("rejected", r.Findings[0].Severity)
+		a.Equal("flatline", r.Findings[1].Code)
+		a.Equal("degraded", r.Findings[1].Severity)
+		a.Equal("high_mean_level", r.Findings[2].Code)
+		a.Equal("degraded", r.Findings[2].Severity)
+	}
+}
+
+func (c *client) scenarioAuditZerosRejected(a *assert.Assertions) {
+	// A stalled capture card still submits perfectly legal values: every
+	// sample is zero, so clipping and mean level see nothing but the whole
+	// sequence is one flatline and the audit rejects before pulse judging.
+	resp, body := c.auditOK(a, 100, make([]float64, 256))
+	a.Equal("rejected", resp.Status, "body: %s", body)
+	a.Equal(0.0, resp.ClippingRatio)
+	a.Equal(256, resp.LongestFlatline)
+	a.Equal(0.0, resp.MeanAbsRatio)
+	if a.Len(resp.Findings, 1) {
+		a.Equal("flatline", resp.Findings[0].Code)
+		a.Equal("rejected", resp.Findings[0].Severity)
+	}
+}
+
+func (c *client) scenarioAuditFullScaleMissing(a *assert.Assertions) {
+	code, body := c.postAuditRaw(a, fmt.Sprintf(`{"samples":[%s]}`, zerosCSV(256)))
+	a.Equal(http.StatusBadRequest, code, "body: %s", body)
+	e := decodeError(a, body)
+	a.Equal("full_scale", e.Field)
+	a.Equal("required", e.Constraint)
+	a.Nil(e.Index)
+}
+
+func (c *client) scenarioAuditFullScaleRange(a *assert.Assertions) {
+	for _, token := range []string{"0", "-1", "-0.5"} {
+		code, body := c.postAuditRaw(a, fmt.Sprintf(
+			`{"full_scale":%s,"samples":[%s]}`, token, zerosCSV(256)))
+		a.Equal(http.StatusBadRequest, code, "token %s body: %s", token, body)
+		e := decodeError(a, body)
+		a.Equal("full_scale", e.Field, token)
+		a.Equal("range", e.Constraint, token)
+		a.Nil(e.Index, token)
+	}
+}
+
+func (c *client) scenarioAuditFullScaleType(a *assert.Assertions) {
+	for _, tc := range []struct {
+		token      string
+		constraint string
+	}{
+		{"null", "type"},
+		{`"100"`, "type"},
+		{"true", "type"},
+		{"[]", "type"},
+		{"NaN", "finite"},
+		{"Infinity", "finite"},
+		{"-Infinity", "finite"},
+	} {
+		code, body := c.postAuditRaw(a, fmt.Sprintf(
+			`{"full_scale":%s,"samples":[%s]}`, tc.token, zerosCSV(256)))
+		a.Equal(http.StatusBadRequest, code, "token %s body: %s", tc.token, body)
+		e := decodeError(a, body)
+		a.Equal("full_scale", e.Field, tc.token)
+		a.Equal(tc.constraint, e.Constraint, tc.token)
+		a.Nil(e.Index, tc.token)
+	}
+}
+
+func (c *client) scenarioAuditTooFew(a *assert.Assertions) {
+	code, body := c.postAuditRaw(a, fmt.Sprintf(
+		`{"full_scale":100,"samples":[%s]}`, zerosCSV(pulse.AuditMinSamples-1)))
+	a.Equal(http.StatusBadRequest, code, "body: %s", body)
+	e := decodeError(a, body)
+	a.Equal("samples", e.Field)
+	a.Equal("min_length", e.Constraint)
+	a.Nil(e.Index)
+}
+
+func (c *client) scenarioAuditTooMany(a *assert.Assertions) {
+	code, body := c.postAuditRaw(a, fmt.Sprintf(
+		`{"full_scale":100,"samples":[%s]}`, zerosCSV(pulse.AuditMaxSamples+1)))
+	a.Equal(http.StatusBadRequest, code, "body: %s", body)
+	e := decodeError(a, body)
+	a.Equal("samples", e.Field)
+	a.Equal("max_length", e.Constraint)
+	a.Nil(e.Index)
+}
+
+func (c *client) scenarioAuditSamplesNotArray(a *assert.Assertions) {
+	code, body := c.postAuditRaw(a, `{"full_scale":100,"samples":2}`)
+	a.Equal(http.StatusBadRequest, code, "body: %s", body)
+	e := decodeError(a, body)
+	a.Equal("samples", e.Field)
+	a.Equal("type", e.Constraint)
+	a.Nil(e.Index)
+}
+
+func (c *client) scenarioAuditElementType(a *assert.Assertions) {
+	values := make([]string, 256)
+	for i := range values {
+		values[i] = "0"
+	}
+	values[42] = `"x"`
+	code, body := c.postAuditRaw(a, fmt.Sprintf(
+		`{"full_scale":100,"samples":[%s]}`, strings.Join(values, ",")))
+	a.Equal(http.StatusBadRequest, code, "body: %s", body)
+	e := decodeError(a, body)
+	a.Equal("samples", e.Field)
+	if a.NotNil(e.Index) {
+		a.Equal(42, *e.Index)
+	}
+	a.Equal("type", e.Constraint)
+}
+
+func (c *client) scenarioAuditElementNonFinite(a *assert.Assertions) {
+	zeros := make([]string, 256)
+	for i := range zeros {
+		zeros[i] = "0"
+	}
+	for _, tc := range []struct {
+		index int
+		token string
+	}{
+		{0, "NaN"},
+		{255, "-Infinity"},
+	} {
+		values := append([]string{}, zeros...)
+		values[tc.index] = tc.token
+		code, body := c.postAuditRaw(a, fmt.Sprintf(
+			`{"full_scale":100,"samples":[%s]}`, strings.Join(values, ",")))
+		a.Equal(http.StatusBadRequest, code, "token %s body: %s", tc.token, body)
+		e := decodeError(a, body)
+		a.Equal("samples", e.Field, tc.token)
+		if a.NotNil(e.Index, tc.token) {
+			a.Equal(tc.index, *e.Index, tc.token)
+		}
+		a.Equal("finite", e.Constraint, tc.token)
+	}
+}
+
+func (c *client) scenarioAuditSamplesMissing(a *assert.Assertions) {
+	code, body := c.postAuditRaw(a, `{"full_scale":100}`)
+	a.Equal(http.StatusBadRequest, code, "body: %s", body)
+	e := decodeError(a, body)
+	a.Equal("samples", e.Field)
+	a.Equal("required", e.Constraint)
+
+	code, body = c.postAuditRaw(a, `{"full_scale":100,"samples":null}`)
+	a.Equal(http.StatusBadRequest, code, "body: %s", body)
+	e = decodeError(a, body)
+	a.Equal("samples", e.Field)
+	a.Equal("type", e.Constraint)
+}
+
+func (c *client) scenarioAuditNoPartialOnError(a *assert.Assertions) {
+	// One sample short of the minimum: only the error envelope comes back;
+	// no audit metric or finding may leak.
+	code, body := c.postAuditRaw(a, fmt.Sprintf(
+		`{"full_scale":100,"samples":[%s]}`, zerosCSV(pulse.AuditMinSamples-1)))
+	a.Equal(http.StatusBadRequest, code, "body: %s", body)
+	var envelope map[string]any
+	if !a.NoError(json.Unmarshal(body, &envelope)) {
+		return
+	}
+	a.NotContains(envelope, "clipping_ratio")
+	a.NotContains(envelope, "longest_flatline")
+	a.NotContains(envelope, "mean_abs_ratio")
+	a.NotContains(envelope, "findings")
+	a.Equal("samples", envelope["field"])
+}
+
+func (c *client) scenarioAuditUnknownField(a *assert.Assertions) {
+	for _, tc := range []struct {
+		name  string
+		raw   string
+		field string
+	}{
+		{"extra field", fmt.Sprintf(
+			`{"full_scale":100,"samples":[%s],"extra":1}`, zerosCSV(256)), "extra"},
+		{"capitalized full_scale", fmt.Sprintf(
+			`{"Full_Scale":100,"samples":[%s]}`, zerosCSV(256)), "Full_Scale"},
+		{"capitalized samples", fmt.Sprintf(
+			`{"full_scale":100,"Samples":[%s]}`, zerosCSV(256)), "Samples"},
+	} {
+		code, body := c.postAuditRaw(a, tc.raw)
+		a.Equal(http.StatusBadRequest, code, "%s body: %s", tc.name, body)
+		e := decodeError(a, body)
+		a.Equal("validation_failed", e.Error, tc.name)
+		a.Equal(tc.field, e.Field, tc.name)
+		a.Equal("unknown", e.Constraint, tc.name)
+		a.NotContains(string(body), "findings", tc.name)
+	}
+}
+
+func (c *client) scenarioAuditDeterminism(a *assert.Assertions) {
+	payload, err := json.Marshal(struct {
+		FullScale float64   `json:"full_scale"`
+		Samples   []float64 `json:"samples"`
+	}{100, make([]float64, 256)})
+	if !a.NoError(err) {
+		return
+	}
+	code, first := c.postAuditRaw(a, string(payload))
+	a.Equal(http.StatusOK, code, "body: %s", first)
+	for i := 0; i < 3; i++ {
+		_, again := c.postAuditRaw(a, string(payload))
+		a.Equal(string(first), string(again), "response %d differs", i+2)
+	}
+}
+
 // --- HTTP helpers -----------------------------------------------------------
 
 func (c *client) waitHealthy(timeout time.Duration) error {
@@ -1591,6 +2011,31 @@ func (c *client) postRaw(a *assert.Assertions, raw string) (int, []byte) {
 
 func (c *client) postCorrelateRaw(a *assert.Assertions, raw string) (int, []byte) {
 	return c.postPath(a, "/api/v1/pulses/correlate", raw)
+}
+
+func (c *client) postAuditRaw(a *assert.Assertions, raw string) (int, []byte) {
+	return c.postPath(a, "/api/v1/acquisition-audits", raw)
+}
+
+// auditOK posts an acquisition audit and expects 200, returning the decoded
+// report.
+func (c *client) auditOK(a *assert.Assertions, fullScale float64, samples []float64) (auditDTO, []byte) {
+	payload, err := json.Marshal(struct {
+		FullScale float64   `json:"full_scale"`
+		Samples   []float64 `json:"samples"`
+	}{fullScale, samples})
+	if !a.NoError(err) {
+		return auditDTO{}, nil
+	}
+	code, body := c.postAuditRaw(a, string(payload))
+	a.Equal(http.StatusOK, code, "body: %s", body)
+
+	var resp auditDTO
+	if !a.NoError(json.Unmarshal(body, &resp)) {
+		return auditDTO{}, body
+	}
+	a.NotNil(resp.Findings)
+	return resp, body
 }
 
 func (c *client) postPath(a *assert.Assertions, path, raw string) (int, []byte) {

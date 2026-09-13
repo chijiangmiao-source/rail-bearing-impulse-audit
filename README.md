@@ -6,7 +6,7 @@
 
 - 语言/框架：Go 1.25、Gin、testify
 - 部署：Docker + Docker Compose（多阶段构建，distroless 运行镜像）
-- 验收：内置名为 `verify` 的一次性验收服务，73 个契约场景
+- 验收：内置名为 `verify` 的一次性验收服务，92 个契约场景
 
 ---
 
@@ -58,6 +58,71 @@
 基线为零或没有保留脉冲时仍返回原不可判定结果与空列表，**不伪造度量**。
 该开关仅属于单通道接口：双通道关联入口不接受 `include_metrics`（在一侧出现
 按未知字段拒绝），其左右分析结果也不出现度量字段，现有客户端无需调整。
+
+## 采集质量审计（`POST /api/v1/acquisition-audits`）
+
+轨旁拾音器松动、前级饱和或采集卡卡死时，送到脉冲判断的仍是**合法数值**，
+脉冲分析本身看不出异常。因此检修工程师需要在脉冲判断**之前**独立取得采集
+质量报告。审计只看原始采样与满量程，不运行脉冲检测：
+
+请求：
+
+```json
+{ "full_scale": 100.0, "samples": [1.0, -1.0, 13.0] }
+```
+
+- `full_scale`：**必填**的正数 JSON number（必须严格大于 0）。
+- `samples`：长度闭区间 **[256, 20000]** 的有限浮点数组（与分析管线共享
+  20000 的上界，下界独立取 256）。
+
+按输入顺序同步计算三项度量：
+
+- `clipping_ratio`：`|x| >= full_scale`（达到满量程即削顶，含负满量程与
+  超出值）的样本占比；
+- `longest_flatline`：**连续相同值最长闭区间**长度（按 float64 位值判等，
+  `-0 == 0`）；
+- `mean_abs_ratio`：绝对均值与满量程之比，即 `mean(|x|) / full_scale`。
+
+状态阈值均为**闭区间、等号即触发**：
+
+| 条件 | 状态 |
+| --- | --- |
+| 削顶占比 `>= 5%`，或最长平线 `>= 64` 点 | `rejected` |
+| 削顶占比 `>= 0.5%`，或最长平线 `>= 16` 点，或均值比 `>= 10%` | `degraded` |
+| 其余 | `healthy` |
+
+`rejected` 永远压过 `degraded`：例如削顶达 5% 时，即便其他指标只是降级，
+整份报告仍是 `rejected`，对应 finding 携带 `rejected` 严重度。
+
+成功（`200`）：
+
+```json
+{
+  "clipping_ratio": 0.05,
+  "longest_flatline": 1,
+  "mean_abs_ratio": 0.0595,
+  "status": "rejected",
+  "findings": [
+    {
+      "code": "clipping",
+      "severity": "rejected",
+      "message": "clipping ratio at or above 5% of samples reaching full scale"
+    }
+  ]
+}
+```
+
+- `findings` 的 `code` 取自固定词表 `clipping` / `flatline` /
+  `high_mean_level`，每个触发指标至多一条；健康时为 `[]`（绝不输出 `null`）。
+- 排序为**固定全序规则**：先按 `code` 字母序，再按 `severity`
+  （`rejected` 先于 `degraded`），最后按 `message`。三条 code 互斥出现，
+  实际顺序即 `clipping`、`flatline`、`high_mean_level`。
+
+错误（`400`）沿用现有错误信封并精确定位：缺失、类型、有限性、范围、长度
+或样本元素错误分别落在 `full_scale` / `samples` 字段或 `samples[i]` 下标
+（`required`/`type`/`finite`/`range`/`min_length`/`max_length`），字段名同样
+大小写敏感，非法请求**不返回任何部分报告**。该端点不改变现有分析与关联
+响应。
 
 ## 输入约束
 
@@ -262,7 +327,7 @@ go run ./cmd/verify -base-url http://127.0.0.1:8080
 # 构建并后台启动 API；宿主端口可用 API_PORT 覆盖
 API_PORT=9090 docker compose up --build -d
 
-# 一次性验收服务（等待 API 健康后运行 73 个场景，退出码 0/1）
+# 一次性验收服务（等待 API 健康后运行 92 个场景，退出码 0/1）
 docker compose run --rm verify
 
 # 或者构建后一起拉起，verify 跑完即退出
@@ -277,9 +342,9 @@ docker compose up --build
 
 ```
 cmd/api/main.go          HTTP 服务入口（含 -healthcheck 探针）
-cmd/verify/main.go       一次性验收服务（testify 断言，69 个场景）
-internal/pulse/          检测算法：单通道接缝屏蔽/基线/候选/合并/过滤/峰值/等级、可选脉冲度量；双通道配对
-internal/api/            Gin 路由、JSON 解码与字段/下标级校验；双通道关联处理器与左右前缀定位
+cmd/verify/main.go       一次性验收服务（testify 断言，92 个场景）
+internal/pulse/          检测算法：单通道接缝屏蔽/基线/候选/合并/过滤/峰值/等级、可选脉冲度量；双通道配对；独立采集质量审计
+internal/api/            Gin 路由、JSON 解码与字段/下标级校验；双通道关联处理器与左右前缀定位；采集审计处理器
 Dockerfile               golang:1.25 多阶段构建 → distroless 静态镜像
 docker-compose.yml       api 服务 + verify 一次性验收服务
 ```
