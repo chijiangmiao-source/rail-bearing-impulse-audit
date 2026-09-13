@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -175,6 +176,29 @@ func TestAuditRoute_LengthBoundariesAccepted(t *testing.T) {
 		}
 		w := auditPost(t, r, 100.0, samples)
 		assert.Equal(t, http.StatusOK, w.Code, "length %d: %s", n, w.Body.String())
+	}
+}
+
+func TestAuditRoute_MaximalFullScaleAndSamplesAreRejectedCompletely(t *testing.T) {
+	// Both full_scale and every sample at the float64 ceiling are legal
+	// (finite, positive full_scale, valid length). The report must come
+	// back whole with mean ratio exactly 1 and status rejected; an
+	// overflow to +Inf made encoding/json fail and the response incomplete.
+	r := NewRouter()
+	samples := auditSamples(math.MaxFloat64, 256)
+	w := auditPost(t, r, math.MaxFloat64, samples)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, "rejected", resp["status"])
+	assert.Equal(t, float64(1), resp["clipping_ratio"])
+	assert.Equal(t, float64(1), resp["mean_abs_ratio"])
+	assert.Equal(t, float64(256), resp["longest_flatline"])
+	findings := resp["findings"].([]any)
+	assert.NotEmpty(t, findings)
+	for _, f := range findings {
+		assert.Contains(t, []string{"clipping", "flatline", "high_mean_level"},
+			f.(map[string]any)["code"])
 	}
 }
 

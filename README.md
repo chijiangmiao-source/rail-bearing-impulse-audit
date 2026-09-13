@@ -6,7 +6,7 @@
 
 - 语言/框架：Go 1.25、Gin、testify
 - 部署：Docker + Docker Compose（多阶段构建，distroless 运行镜像）
-- 验收：内置名为 `verify` 的一次性验收服务，92 个契约场景
+- 验收：内置名为 `verify` 的一次性验收服务，93 个契约场景
 
 ---
 
@@ -82,6 +82,10 @@
 - `longest_flatline`：**连续相同值最长闭区间**长度（按 float64 位值判等，
   `-0 == 0`）；
 - `mean_abs_ratio`：绝对均值与满量程之比，即 `mean(|x|) / full_scale`。
+  采用先按最大幅值缩放求均值、最后再除以满量程的顺序，满量程与样本同时取
+  float64 最大有限值时不会因中间乘法溢出为无穷，报告仍为完整的
+  `mean_abs_ratio=1` 拒绝报告；真实比值超出 float64 表示域的极端不匹配
+  （次正规满量程对极大样本）则饱和到 float64 上界，状态与 findings 不变。
 
 状态阈值均为**闭区间、等号即触发**：
 
@@ -327,7 +331,7 @@ go run ./cmd/verify -base-url http://127.0.0.1:8080
 # 构建并后台启动 API；宿主端口可用 API_PORT 覆盖
 API_PORT=9090 docker compose up --build -d
 
-# 一次性验收服务（等待 API 健康后运行 92 个场景，退出码 0/1）
+# 一次性验收服务（等待 API 健康后运行 93 个场景，退出码 0/1）
 docker compose run --rm verify
 
 # 或者构建后一起拉起，verify 跑完即退出
@@ -342,7 +346,7 @@ docker compose up --build
 
 ```
 cmd/api/main.go          HTTP 服务入口（含 -healthcheck 探针）
-cmd/verify/main.go       一次性验收服务（testify 断言，92 个场景）
+cmd/verify/main.go       一次性验收服务（testify 断言，93 个场景）
 internal/pulse/          检测算法：单通道接缝屏蔽/基线/候选/合并/过滤/峰值/等级、可选脉冲度量；双通道配对；独立采集质量审计
 internal/api/            Gin 路由、JSON 解码与字段/下标级校验；双通道关联处理器与左右前缀定位；采集审计处理器
 Dockerfile               golang:1.25 多阶段构建 → distroless 静态镜像

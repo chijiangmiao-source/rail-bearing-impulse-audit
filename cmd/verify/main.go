@@ -230,6 +230,7 @@ func main() {
 	run("audit: mean level equality at 10% degrades", c.scenarioAuditMeanBoundary)
 	run("audit: rejected wins over degraded findings in fixed order", c.scenarioAuditFindingsOrder)
 	run("audit: all-legal zeros are rejected as a stalled-card flatline", c.scenarioAuditZerosRejected)
+	run("audit: maximal full_scale and samples return a complete ratio-1 rejection", c.scenarioAuditExtremeFullScale)
 	run("audit: missing full_scale is located at full_scale", c.scenarioAuditFullScaleMissing)
 	run("audit: zero or negative full_scale is located at full_scale", c.scenarioAuditFullScaleRange)
 	run("audit: null and wrong-typed full_scale are located at full_scale", c.scenarioAuditFullScaleType)
@@ -1789,6 +1790,28 @@ func (c *client) scenarioAuditZerosRejected(a *assert.Assertions) {
 	if a.Len(resp.Findings, 1) {
 		a.Equal("flatline", resp.Findings[0].Code)
 		a.Equal("rejected", resp.Findings[0].Severity)
+	}
+}
+
+func (c *client) scenarioAuditExtremeFullScale(a *assert.Assertions) {
+	// Both full_scale and every sample sit at the largest legal finite
+	// float. They are all legal inputs; the report must come back complete
+	// with mean_abs_ratio exactly 1, clipping ratio 1 and a 256-sample
+	// flatline — a rejected report. Multiplying before dividing used to
+	// overflow the ratio to +Inf, which made the JSON response incomplete.
+	resp, body := c.auditOK(a, math.MaxFloat64,
+		flatSamples(256, math.MaxFloat64, nil))
+	a.Equal("rejected", resp.Status, "body: %s", body)
+	a.Equal(1.0, resp.MeanAbsRatio)
+	a.Equal(1.0, resp.ClippingRatio)
+	a.Equal(256, resp.LongestFlatline)
+	if a.Len(resp.Findings, 3) {
+		a.Equal("clipping", resp.Findings[0].Code)
+		a.Equal("rejected", resp.Findings[0].Severity)
+		a.Equal("flatline", resp.Findings[1].Code)
+		a.Equal("rejected", resp.Findings[1].Severity)
+		a.Equal("high_mean_level", resp.Findings[2].Code)
+		a.Equal("degraded", resp.Findings[2].Severity)
 	}
 }
 

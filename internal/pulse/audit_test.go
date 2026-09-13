@@ -1,6 +1,7 @@
 package pulse
 
 import (
+	"encoding/json"
 	"math"
 	"testing"
 
@@ -250,4 +251,51 @@ func TestAudit_HugeFiniteValuesStayFinite(t *testing.T) {
 	// One clip is below the 0.5% clipping boundary, but the enormous mean
 	// level flags the capture as degraded.
 	assert.Equal(t, AuditDegraded, a.Status)
+}
+
+func TestAudit_MaximalFullScaleAndSamplesYieldRatioOne(t *testing.T) {
+	// Both full_scale and every sample sit at the float64 ceiling. The
+	// correct ratio is mean/full_scale = 1, the samples are all clipped
+	// (ratio 1) and the whole sequence is one flatline: the report must be
+	// complete, finite and rejected. A left-associating multiply-then-divide
+	// overflows to +Inf here and makes the JSON report impossible.
+	samples := make([]float64, 256)
+	for i := range samples {
+		samples[i] = math.MaxFloat64
+	}
+	a := AuditAcquisition(samples, math.MaxFloat64)
+	assert.Equal(t, 1.0, a.MeanAbsRatio)
+	assert.Equal(t, 1.0, a.ClippingRatio)
+	assert.Equal(t, 256, a.LongestFlatline)
+	assert.Equal(t, AuditRejected, a.Status)
+	assert.False(t, math.IsInf(a.MeanAbsRatio, 0))
+
+	// The report must round-trip through JSON; encoding/json refuses Inf.
+	b, err := json.Marshal(a)
+	require.NoError(t, err)
+	var decoded AcquisitionAudit
+	require.NoError(t, json.Unmarshal(b, &decoded))
+	assert.Equal(t, a, decoded)
+}
+
+func TestAudit_HugeSamplesTinyFullScaleStaysFinite(t *testing.T) {
+	// A subnormal full scale against maximal samples yields a true ratio
+	// beyond the float64 range: it cannot be represented, but the report
+	// must still come back finite and rejected rather than failing to
+	// serialize.
+	samples := make([]float64, 256)
+	for i := range samples {
+		if i%2 == 0 {
+			samples[i] = math.MaxFloat64
+		} else {
+			samples[i] = -math.MaxFloat64
+		}
+	}
+	a := AuditAcquisition(samples, math.SmallestNonzeroFloat64)
+	assert.False(t, math.IsInf(a.MeanAbsRatio, 0))
+	assert.False(t, math.IsNaN(a.MeanAbsRatio))
+	assert.Equal(t, 1.0, a.ClippingRatio)
+	assert.Equal(t, AuditRejected, a.Status, "100% clipping rejects regardless of the ratio")
+	_, err := json.Marshal(a)
+	require.NoError(t, err)
 }

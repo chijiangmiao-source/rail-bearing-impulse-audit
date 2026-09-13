@@ -120,9 +120,30 @@ func AuditAcquisition(samples []float64, fullScale float64) AcquisitionAudit {
 		}
 	}
 
+	// q is the mean absolute value as a fraction of the largest magnitude,
+	// so 0 <= q <= 1. Multiplying q by maxAbs yields the mean, which never
+	// exceeds maxAbs and therefore cannot overflow; dividing only at the
+	// end keeps the symmetric maximal case mean=maxAbs finite and yields
+	// exactly 1 when full_scale equals the maximum. A plain "sum then
+	// divide" (or maxAbs*scaledSum before any division) overflows to +Inf
+	// the moment full_scale and the samples both approach the float64
+	// ceiling, even though the ratio itself is simply 1.
 	n := float64(len(samples))
 	clippingRatio := float64(clipped) / n
-	meanAbsRatio := maxAbs * scaledSum / n / fullScale
+
+	// q is the mean absolute value as a fraction of the largest magnitude,
+	// so 0 <= q <= 1. Multiplying q by maxAbs yields the mean, which never
+	// exceeds maxAbs and therefore cannot overflow; dividing only at the
+	// end keeps the symmetric maximal case mean=maxAbs finite and yields
+	// exactly 1 when full_scale equals the maximum. A plain "sum then
+	// divide" (or maxAbs*scaledSum before any division) overflows to +Inf
+	// the moment full_scale and the samples both approach the float64
+	// ceiling, even though the ratio itself is simply 1.
+	q := 0.0
+	if maxAbs > 0 {
+		q = scaledSum / n
+	}
+	meanAbsRatio := boundedRatio(q*maxAbs, fullScale)
 
 	audit := AcquisitionAudit{
 		ClippingRatio:   clippingRatio,
@@ -187,4 +208,18 @@ func AuditAcquisition(samples []float64, fullScale float64) AcquisitionAudit {
 	})
 
 	return audit
+}
+
+// boundedRatio returns mean/fullScale as a finite JSON number. Numerator and
+// denominator are both finite and positive; the division can still overflow
+// only when the true ratio exceeds the float64 range (a subnormal full
+// scale against maximal samples). Such a ratio is far past every threshold
+// regardless, so saturating at the float64 ceiling preserves the status and
+// findings while keeping the report serializable; JSON cannot carry Inf.
+func boundedRatio(mean, fullScale float64) float64 {
+	r := mean / fullScale
+	if math.IsInf(r, 0) {
+		return math.MaxFloat64
+	}
+	return r
 }
